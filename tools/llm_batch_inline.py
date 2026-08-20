@@ -50,6 +50,39 @@ def signed(url: str) -> str:
     return url if "sig=" in url else f"{url}?{sas_query()}"
 
 
+def write_sas_query() -> str:
+    sas = os.environ.get("MEDIA_BLOB_WRITE_SAS") or os.environ.get("PHASE2_SHOT_BLOB_SAS", "")
+    if not sas:
+        raise SystemExit("MEDIA_BLOB_WRITE_SAS missing (needed to persist results to blob)")
+    return sas.split("?", 1)[1] if "?" in sas else sas.lstrip("?")
+
+
+def blob_put(url: str, data: bytes, ct: str = "application/json") -> None:
+    r = requests.put(f"{url}?{write_sas_query()}", data=data,
+                     headers={"x-ms-blob-type": "BlockBlob", "Content-Type": ct}, timeout=600)
+    if r.status_code not in (200, 201):
+        raise SystemExit(f"blob PUT {url.rsplit('/', 1)[-1]}: HTTP {r.status_code} {r.text[:160]}")
+
+
+def publish(res_path: Path, jobs: list, a, collected: int) -> None:
+    """Persist results to blob at the same paths the file-based collector uses:
+        llm-batch/<client>/<dataset>/results/<shard>.jsonl   + .../status/<shard>.json
+    The workflow artifact expires in 7 days, so the artifact alone is not storage --
+    without this a finished run's only copy of billed results ages out.
+    fleet_sync() reads the status stub and picks up results_url from it."""
+    base = a.skeleton_url.rsplit("/", 1)[0]
+    results_url = f"{base}/results/{a.shard}.jsonl"
+    blob_put(results_url, res_path.read_bytes(), "application/x-ndjson")
+    stub = {"client": a.client, "dataset": a.dataset, "shard": a.shard, "mode": "batch_inline",
+            "job": jobs[0][0] if jobs else None, "jobs": [n for n, _ in jobs],
+            "display_name": f"{a.client}/{a.dataset}/{a.shard}",
+            "state": "SUCCEEDED" if collected == len(jobs) else "PARTIAL",
+            "collected_jobs": collected, "total_jobs": len(jobs),
+            "results_url": results_url, "input_deleted": True}  # inline: no Files API input to delete
+    blob_put(f"{base}/status/{a.shard}.json", json.dumps(stub).encode("utf-8"))
+    print(f"published -> {results_url}  (stub: status/{a.shard}.json, {collected}/{len(jobs)} jobs)")
+
+
 def fetch_resized(url: str, dim: int) -> bytes:
     last = None
     for attempt in range(4):
@@ -246,6 +279,9 @@ def collect(client, jobs, out, a, t0) -> None:
                       f"({time.time() - t0:.0f}s)", flush=True)
                 time.sleep(30)
     print(f"collected {done}/{len(jobs)} jobs in {time.time() - t0:.0f}s -> {res_path.name}")
+    # Publish whatever was collected, including a partial run: results already billed
+    # must not be stranded in an artifact that expires.
+    publish(res_path, jobs, a, done)
     if pending:
         print(f"WARNING {len(pending)} jobs still running at timeout; their results are NOT "
               f"in the artifact. Re-collect with batches.list(display_name prefix "
