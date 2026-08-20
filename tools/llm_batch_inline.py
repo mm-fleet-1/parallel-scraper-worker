@@ -109,9 +109,13 @@ def main() -> None:
     ap.add_argument("--send-dim", type=int, default=1536)
     ap.add_argument("--per-job", type=int, default=1)
     ap.add_argument("--limit", type=int, default=0, help="0 = whole shard")
-    ap.add_argument("--wait-minutes", type=int, default=40)
+    ap.add_argument("--wait-minutes", type=int, default=150,
+                    help="measured per-job tail was 4,082s (68 min); 40 strands results")
     ap.add_argument("--workers", type=int, default=16)
     ap.add_argument("--out-dir", default="batch_out")
+    ap.add_argument("--collect-only", action="store_true",
+                    help="skip submission; re-collect jobs already created for this shard "
+                         "(recovers a run killed mid-collect, or one that hit wait-minutes)")
     a = ap.parse_args()
 
     key = os.environ.get("LLM_BATCH_GEMINI_KEY")
@@ -120,6 +124,38 @@ def main() -> None:
     from google import genai
 
     t0 = time.time()
+    out = Path(a.out_dir)
+    out.mkdir(parents=True, exist_ok=True)
+
+    if a.collect_only:
+        from google import genai as _genai
+        client = _genai.Client(api_key=key)
+        prefix = f"{a.client}/{a.dataset}/{a.shard}-"
+        jp = out / f"{a.client}_{a.dataset}_{a.shard}.jobs.json"
+        if jp.exists():  # the submitting run got far enough to write the keymap: trust it
+            jobs = [(d["job"], d["keys"]) for d in json.loads(jp.read_text(encoding="utf-8"))]
+            print(f"collect-only: {len(jobs)} jobs from {jp.name}", flush=True)
+            collect(client, jobs, out, a, t0)
+            return
+        # No keymap on disk (fresh runner). The keyset per job is not stored on the job
+        # itself, so rebuild it from the same skeleton, sliced the same way -- this is
+        # why display_name encodes the skeleton offset: "<shard>-0012-0" starts at row 12.
+        rr = requests.get(signed(a.skeleton_url), timeout=120)
+        rr.raise_for_status()
+        sk = [json.loads(ln) for ln in rr.text.splitlines() if ln.strip()]
+        jobs = []
+        for b in client.batches.list(config={"page_size": 200}):
+            dn = b.display_name or ""
+            if not dn.startswith(prefix):
+                continue
+            i = int(dn[len(prefix):].split("-")[0])
+            jobs.append((b.name, [x["key"] for x in sk[i:i + a.per_job]]))
+        if not jobs:
+            raise SystemExit(f"no jobs found with display_name prefix {prefix!r}")
+        print(f"collect-only: {len(jobs)} existing jobs for {a.shard}", flush=True)
+        collect(client, jobs, out, a, t0)
+        return
+
     r = requests.get(signed(a.skeleton_url), timeout=120)
     r.raise_for_status()
     skel = [json.loads(ln) for ln in r.text.splitlines() if ln.strip()]
@@ -127,8 +163,6 @@ def main() -> None:
         skel = skel[:a.limit]
     print(f"skeleton {a.shard}: {len(skel)} requests, per_job={a.per_job}", flush=True)
 
-    out = Path(a.out_dir)
-    out.mkdir(parents=True, exist_ok=True)
     client = genai.Client(api_key=key)
     jobs = []  # (job_name, [keys])
     with ThreadPoolExecutor(max_workers=a.workers * 2) as images:
@@ -157,7 +191,13 @@ def main() -> None:
     (out / f"{a.client}_{a.dataset}_{a.shard}.jobs.json").write_text(
         json.dumps([{"job": n, "keys": k} for n, k in jobs], indent=1), encoding="utf-8")
 
-    # ---- collect: inline results live on the job, so poll and write them out here
+    collect(client, jobs, out, a, t0)
+
+
+def collect(client, jobs, out, a, t0) -> None:
+    """Poll the jobs and write their inline responses. Split out so --collect-only can
+    recover a run that died mid-collect -- otherwise the results are stranded on jobs
+    that already billed."""
     res_path = out / f"{a.client}_{a.dataset}_{a.shard}.results.jsonl"
     deadline = time.time() + a.wait_minutes * 60
     pending = dict(jobs)
@@ -170,10 +210,25 @@ def main() -> None:
                 if st not in ("SUCCEEDED", "FAILED", "CANCELLED", "EXPIRED"):
                     continue
                 keys = pending.pop(name)
-                for n, resp in enumerate(getattr(b.dest, "inlined_responses", None) or []):
-                    k = keys[n] if n < len(keys) else f"{name}#{n}"
+                resps = list(getattr(b.dest, "inlined_responses", None) or [])
+                # Inline responses are positional -- the ONLY thing tying a result to an
+                # outlet is its index in this job's keyset. A short or over-long list
+                # would silently shift every later key onto the wrong outlet, so a
+                # mismatch is a hard error, never a best-effort zip.
+                if resps and len(resps) != len(keys):
+                    raise SystemExit(
+                        f"{name}: {len(resps)} inlined_responses for {len(keys)} keys "
+                        f"({st}). Refusing to guess the mapping -- results would be "
+                        f"attributed to the wrong outlets. keys={keys}")
+                for n, k in enumerate(keys):
+                    resp = resps[n] if n < len(resps) else None
                     rec = {"key": k, "job": name, "state": st}
-                    if getattr(resp, "error", None) or not getattr(resp, "response", None):
+                    if resp is None:
+                        # FAILED/EXPIRED/CANCELLED jobs return no responses at all. Emit a
+                        # row anyway: a key with no row is invisible to every resume path
+                        # and the outlet is silently dropped from the dataset.
+                        rec["error"] = f"no response (job {st})"
+                    elif getattr(resp, "error", None) or not getattr(resp, "response", None):
                         rec["error"] = str(getattr(resp, "error", "no response"))[:300]
                     else:
                         cand = (resp.response.candidates or [None])[0]
