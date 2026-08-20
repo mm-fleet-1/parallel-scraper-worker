@@ -51,6 +51,22 @@ _DOW_RE = re.compile("|".join(_DOWS), re.I)
 # 'SAR 20–40 per person' / 'SAR 1-20' — en dash and hyphen both occur.
 _PRICE_RE = re.compile(r"([A-Z]{3}|[^\W\d_]{1,4})\s*([\d,]+)\s*[–\-—]\s*([\d,]+)")
 _PRICE_ONE = re.compile(r"([A-Z]{3})\s*([\d,]+)")
+# Which panel lines the fallback may treat as a price band AT ALL. _PRICE_ONE alone
+# matches any 3 capitals followed by digits, so it swallowed plus-code addresses
+# ('MPH6+GJ Al Wizarat' -> currency MPH, price 6), hotel names ('OYO 165 ...') and
+# codes like 'TOP100' — 5,987 bad rows in the Riyadh run. A real band is the WHOLE
+# line: currency, a space, digits, optionally a range / '+' / truncation ellipsis.
+_PRICE_BAND_LINE = re.compile(r"^[A-Z]{3}\s[\d,]+(\s*[–\-—]\s*[\d,]+)?\s*\+?\s*…?$")
+# ...and the 3 letters must be a real currency. Business names shaped exactly like a
+# band ("BUS 253", "FOX 16", "NSK 2022") slip through the pattern otherwise.
+# Extend when a run moves to a new country.
+_CURRENCIES = {
+    "SAR", "AED", "QAR", "KWD", "BHD", "OMR", "JOD", "EGP", "TRY", "ILS",
+    "INR", "PKR", "BDT", "LKR", "NPR",
+    "USD", "EUR", "GBP", "CHF", "CAD", "AUD", "NZD",
+    "IDR", "PHP", "VND", "MYR", "SGD", "THB", "CNY", "JPY", "KRW", "HKD",
+    "ZAR", "KES", "NGN", "MAD", "TND", "DZD",
+}
 _REPORTED_RE = re.compile(r"Reported by\s+([\d,]+)", re.I)
 
 _JS_PANEL = """() => {
@@ -184,12 +200,19 @@ def parse_price(lines: list[str]) -> dict:
                  "price_currency": None, "price_reported_by": None}
     for ln in lines:
         if "per person" in ln.lower() and any(ch.isdigit() for ch in ln):
-            out["price_range_text"] = ln.replace("\xa0", " ").strip()
+            clean = ln.replace("\xa0", " ").strip()
+            # 'per person' is Google's own price row, so this branch is trustworthy --
+            # but a run in a country whose currency is not yet in _CURRENCIES should
+            # drop the band rather than store a bogus currency code.
+            if clean[:3].isupper() and clean[:3].isalpha() and clean[:3] not in _CURRENCIES:
+                continue
+            out["price_range_text"] = clean
             break
     if not out["price_range_text"]:
         for ln in lines:
-            if _PRICE_ONE.match(ln.replace("\xa0", " ").strip()):
-                out["price_range_text"] = ln.replace("\xa0", " ").strip()
+            clean = ln.replace("\xa0", " ").strip()
+            if _PRICE_BAND_LINE.match(clean) and clean[:3] in _CURRENCIES:
+                out["price_range_text"] = clean
                 break
     txt = (out["price_range_text"] or "").replace("\xa0", " ")
     m = _PRICE_RE.search(txt)
@@ -537,3 +560,30 @@ def normalize_menu_items(rows) -> list[dict]:
                     "currency": m.group(1).upper(),
                     "price_amount": float(m.group(2).replace(",", ""))})
     return out
+
+
+def _selfcheck_price() -> None:
+    """parse_price must accept real bands and reject addresses / names / codes."""
+    good = {
+        "SAR 20–40 per person": (20.0, 40.0),
+        "SAR 1-20 per person": (1.0, 20.0),
+        "SAR 20–40": (20.0, 40.0),
+        "SAR 120–140…": (120.0, 140.0),
+        "SAR 200+…": (200.0, 200.0),
+    }
+    for line, (lo, hi) in good.items():
+        got = parse_price([line])
+        assert got["price_min"] == lo and got["price_max"] == hi, (line, got)
+    bad = ["BUS 253", "FOX 16", "NSK 2022", "MBS 1",
+           "MPH6+GJ Al Wizarat, Riyadh Saudi Arabia",
+           "HQV4+3X9, Al Aziziyah, Riyadh 14512, Saudi Arabia",
+           "OYO 165 Orchida Al Hamra", "TOP100", "BDR222",
+           "JHR4+RGQ, Dhahrat Laban, Riyadh 13782, Saudi Arabia"]
+    for line in bad:
+        got = parse_price([line])
+        assert got["price_range_text"] is None, (line, got)
+    print("parse_price selfcheck OK")
+
+
+if __name__ == "__main__":
+    _selfcheck_price()
