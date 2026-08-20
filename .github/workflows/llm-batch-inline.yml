@@ -1,0 +1,74 @@
+name: llm-batch-inline
+
+# Sibling of llm-batch-build: creates Gemini Batch jobs with INLINE requests instead
+# of uploading an input file to the Files API. No 20 GB budget, no upload step, and
+# the runner collects the results itself (inline results are attached to the job, not
+# written to an output file, so the normal collector cannot see them).
+#
+# Small jobs appear to get more concurrent request slots than a few large ones, which
+# is what this is for. Manual dispatch only; additive -- it changes nothing about
+# llm-batch-build.yml or llm-batch-collect.yml.
+on:
+  workflow_dispatch:
+    inputs:
+      client:        { required: true,  type: string, description: "client id, e.g. flora" }
+      dataset:       { required: true,  type: string, description: "dataset id, e.g. prod_p1" }
+      shards:        { required: true,  type: string, description: "comma-separated shard names" }
+      skeleton_base: { required: true,  type: string, description: "blob URL prefix holding <shard>.jsonl (no SAS)" }
+      model:         { required: true,  type: string, default: "gemini-3.7-flash" }
+      per_job:       { required: false, type: string, default: "1",  description: "outlets per batch job (20 MB cap ~= 4)" }
+      limit:         { required: false, type: string, default: "0",  description: "0 = whole shard; use a small number to test" }
+      wait_minutes:  { required: false, type: string, default: "150", description: "measured per-job tail is 68 min; 40 strands results" }
+      send_dim:      { required: false, type: string, default: "1536" }
+      max_parallel:  { required: false, type: string, default: "13" }
+
+concurrency:
+  group: llm-batch-inline-${{ inputs.client }}-${{ inputs.dataset }}
+  cancel-in-progress: false
+
+jobs:
+  plan:
+    runs-on: ubuntu-22.04
+    outputs:
+      matrix: ${{ steps.mk.outputs.matrix }}
+    steps:
+      - id: mk
+        env:
+          SHARDS: ${{ inputs.shards }}
+        run: |
+          python3 -c 'import json,os; print("matrix=" + json.dumps([s.strip() for s in os.environ["SHARDS"].split(",") if s.strip()]))' >> "$GITHUB_OUTPUT"
+
+  inline:
+    needs: plan
+    runs-on: ubuntu-22.04
+    timeout-minutes: 180
+    strategy:
+      fail-fast: false
+      max-parallel: ${{ fromJson(inputs.max_parallel) }}
+      matrix:
+        shard: ${{ fromJson(needs.plan.outputs.matrix) }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - run: pip install --quiet requests pillow google-genai
+      - name: Create inline batch jobs + collect
+        env:
+          LLM_BATCH_GEMINI_KEY: ${{ secrets.LLM_BATCH_GEMINI_KEY }}
+          MEDIA_BLOB_READ_SAS: ${{ secrets.MEDIA_BLOB_READ_SAS }}
+        run: |
+          python tools/llm_batch_inline.py \
+            --skeleton-url "${{ inputs.skeleton_base }}/${{ matrix.shard }}.jsonl" \
+            --client "${{ inputs.client }}" --dataset "${{ inputs.dataset }}" --shard "${{ matrix.shard }}" \
+            --model "${{ inputs.model }}" --send-dim "${{ inputs.send_dim }}" \
+            --per-job "${{ inputs.per_job }}" --limit "${{ inputs.limit }}" \
+            --wait-minutes "${{ inputs.wait_minutes }}"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: inline-${{ inputs.client }}-${{ inputs.dataset }}-${{ matrix.shard }}
+          path: |
+            batch_out/*.results.jsonl
+            batch_out/*.jobs.json
+          retention-days: 7
