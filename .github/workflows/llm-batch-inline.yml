@@ -8,6 +8,10 @@ name: llm-batch-inline
 # Small jobs appear to get more concurrent request slots than a few large ones, which
 # is what this is for. Manual dispatch only; additive -- it changes nothing about
 # llm-batch-build.yml or llm-batch-collect.yml.
+#
+# Results are written to blob at llm-batch/<client>/<dataset>/results/<shard>.jsonl with a
+# status stub alongside -- the same paths llm_batch_collect.py uses, so fleet_sync picks
+# them up. The uploaded artifact is a 7-day debugging convenience, NOT the storage.
 on:
   workflow_dispatch:
     inputs:
@@ -57,6 +61,8 @@ jobs:
         env:
           LLM_BATCH_GEMINI_KEY: ${{ secrets.LLM_BATCH_GEMINI_KEY }}
           MEDIA_BLOB_READ_SAS: ${{ secrets.MEDIA_BLOB_READ_SAS }}
+          MEDIA_BLOB_WRITE_SAS: ${{ secrets.MEDIA_BLOB_WRITE_SAS }}
+          PHASE2_SHOT_BLOB_SAS: ${{ secrets.PHASE2_SHOT_BLOB_SAS }}
         run: |
           python tools/llm_batch_inline.py \
             --skeleton-url "${{ inputs.skeleton_base }}/${{ matrix.shard }}.jsonl" \
