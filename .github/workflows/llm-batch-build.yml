@@ -12,6 +12,8 @@ on:
       model:         { required: true,  type: string, default: "gemini-3.7-flash" }
       send_dim:      { required: false, type: string, default: "1536" }
       max_parallel:  { required: false, type: string, default: "13" }
+      collect:       { required: false, type: boolean, default: true,  description: "chain a collect job that polls until every shard is collected to blob" }
+      collect_wait_minutes: { required: false, type: string, default: "180", description: "give up polling after this long; uncollected jobs need a manual llm-batch-collect" }
 
 concurrency:
   group: llm-batch-${{ inputs.client }}-${{ inputs.dataset }}
@@ -58,3 +60,29 @@ jobs:
           name: job-${{ inputs.client }}-${{ inputs.dataset }}-${{ matrix.shard }}
           path: batch_out/*.job.json
           retention-days: 7
+
+  # Collect exactly when a run is active. The llm-batch-collect cron was removed
+  # 2026-08-21 (a cron records a run even when its `if` skips it, so a dormant collector
+  # produced ~288 no-op runs/day). Chaining it here means nothing fires while idle, and a
+  # finished build is never left with its results stranded in the Files API.
+  # `needs: build` waits for the whole shard matrix; the batch jobs are still RUNNING at
+  # that point, which is why this uses --wait-minutes rather than a single sweep.
+  collect:
+    needs: build
+    if: ${{ always() && inputs.collect }}
+    runs-on: ubuntu-22.04
+    timeout-minutes: 350
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - run: pip install --quiet requests google-genai
+      - name: Poll + collect this dataset -> blob
+        env:
+          LLM_BATCH_GEMINI_KEY: ${{ secrets.LLM_BATCH_GEMINI_KEY }}
+          MEDIA_BLOB_READ_SAS: ${{ secrets.MEDIA_BLOB_READ_SAS }}
+          MEDIA_BLOB_WRITE_SAS: ${{ secrets.MEDIA_BLOB_WRITE_SAS }}
+          PHASE2_SHOT_BLOB_SAS: ${{ secrets.PHASE2_SHOT_BLOB_SAS }}
+        run: |
+          python tools/llm_batch_collect.py             --client "${{ inputs.client }}" --dataset "${{ inputs.dataset }}"             --wait-minutes "${{ inputs.collect_wait_minutes }}"
