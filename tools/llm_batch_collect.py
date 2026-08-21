@@ -47,6 +47,9 @@ def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--client")
     ap.add_argument("--dataset")
+    ap.add_argument("--wait-minutes", type=int, default=0,
+                    help="poll until every matching job is terminal (0 = single sweep, the cron behaviour). "
+                         "Used when chained onto llm-batch-build, where jobs are still RUNNING at first sweep.")
     ap.add_argument("--keep-inputs", action="store_true", help="do not delete Files-API inputs after collect")
     a = ap.parse_args()
     key = os.environ.get("LLM_BATCH_GEMINI_KEY") or sys.exit("LLM_BATCH_GEMINI_KEY missing")
@@ -54,6 +57,20 @@ def main() -> None:
     from google import genai
     client = genai.Client(api_key=key)
 
+    deadline = time.time() + a.wait_minutes * 60
+    while True:
+        r = sweep(a, client, rq, wq)
+        if not a.wait_minutes or r["unfinished"] == 0:
+            break
+        if time.time() >= deadline:
+            print(f"WARNING {r['unfinished']} job(s) still running at --wait-minutes={a.wait_minutes}. "
+                  f"Their results are NOT collected; re-dispatch this workflow to finish.")
+            break
+        print(f"  {r['unfinished']} job(s) still running; re-checking in 60s", flush=True)
+        time.sleep(60)
+
+
+def sweep(a, client, rq, wq) -> dict:
     now = datetime.now(timezone.utc).isoformat(timespec="seconds")
     # BatchJob does not expose its source file; the builder uploads it as "<client>_<dataset>_<shard>.jsonl",
     # so map display_name -> file name once here.
@@ -64,7 +81,7 @@ def main() -> None:
                 files_by_display[f.display_name] = f.name
     except Exception as exc:  # noqa: BLE001
         print(f"files.list failed: {str(exc)[:120]}")
-    seen = collected = failed = 0
+    seen = collected = failed = unfinished = 0
     # A shard can be re-dispatched (new job, same display_name); only the NEWEST job per name is authoritative.
     by_name: dict[str, list] = {}
     for job in client.batches.list():
@@ -137,9 +154,14 @@ def main() -> None:
                 if not gone:
                     stub["input_delete_error"] = str(exc)[:300]
                     print(f"  files.delete({src}) failed: {str(exc)[:200]}")
+        if state != "JOB_STATE_SUCCEEDED" and state not in TERMINAL_BAD:
+            unfinished += 1
         blob_put(status_url, json.dumps(stub).encode("utf-8"), wq)
         print(f"{dn:48} {state:24} pending={stub['pending_request_count']} collected={'yes' if stub['results_url'] else 'no'} input_deleted={stub['input_deleted']}")
-    print(json.dumps({"jobs_seen": seen, "newly_collected": collected, "failed": failed, "checked_at": now}))
+    out = {"jobs_seen": seen, "newly_collected": collected, "failed": failed,
+           "unfinished": unfinished, "checked_at": now}
+    print(json.dumps(out))
+    return out
 
 
 if __name__ == "__main__":
