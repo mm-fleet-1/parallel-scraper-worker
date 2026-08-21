@@ -131,8 +131,13 @@ def sweep(a, client, rq, wq) -> dict:
                     data = client.files.download(file=fname)
                     text = data.decode("utf-8") if isinstance(data, bytes) else str(data)
                 else:
-                    text = "\n".join(json.dumps(r.to_json_dict() if hasattr(r, "to_json_dict") else r)
-                                     for r in (getattr(dest, "inlined_responses", None) or []))
+                    # INLINE job: dest.inlined_responses carry no key, so anything written
+                    # here is unattributable and can never be ingested. llm_batch_inline.py
+                    # publishes these itself, keyed from the per-job keymap it records at
+                    # submit time -- so skip rather than write junk. (158 keyless blobs
+                    # were produced this way before it was caught, 2026-08-21.)
+                    print(f"  skip {dn}: inline job, published by llm_batch_inline.py")
+                    continue
                 blob_put(results_url, text.encode("utf-8"), wq, "application/x-ndjson")
                 collected += 1
                 print(f"collected {dn} -> {results_url} ({len(text) / 1e6:.1f} MB)")
