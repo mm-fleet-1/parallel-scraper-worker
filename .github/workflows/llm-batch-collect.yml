@@ -3,9 +3,13 @@ name: llm-batch-collect
 # Generic: every 15 min, collect finished Gemini batch jobs of this project to blob and free their
 # Files-API inputs. Dormant unless repo variable LLM_BATCH_ACTIVE == "1" (or manual dispatch).
 # Only talks to Google + blob (a few API calls) — nothing touches the lease API.
+# Manual dispatch ONLY. The */15 cron was removed 2026-08-21: GitHub records a run for
+# every cron evaluation even when the job-level `if` skips it, so a dormant collector was
+# still producing ~288 no-op run records a day across the 3 repos that have this file.
+# The LLM_BATCH_ACTIVE gate below is kept as a second guard.
+# NOTE: nothing auto-collects any more -- dispatch this after a chunked batch run, or
+# chain it onto llm-batch-build.yml.
 on:
-  schedule:
-    - cron: "*/15 * * * *"
   workflow_dispatch:
     inputs:
       client:  { required: false, type: string, default: "" }
