@@ -14,9 +14,10 @@ on:
     inputs:
       shards:      { required: true,  type: string, description: "comma-separated shard names (files in name_local_shards/)" }
       out_base:    { required: true,  type: string, description: "blob URL prefix for results (no SAS)" }
-      concurrency: { required: false, type: string, default: "8", description: "pages per runner; raises per-IP rate" }
+      concurrency: { required: false, type: string, default: "3", description: "pages per runner. 8 collapsed to 16/min with ~50% errors on a 2-core runner" }
       limit:       { required: false, type: string, default: "0", description: "0 = whole shard" }
       max_parallel: { required: false, type: string, default: "20" }
+      min_coverage: { required: false, type: string, default: "90", description: "fail the job below this % of the shard" }
 
 concurrency:
   group: name-local
@@ -63,4 +64,5 @@ jobs:
             --out-base "${{ inputs.out_base }}" \
             --shard "${{ matrix.shard }}" \
             --concurrency "${{ inputs.concurrency }}" \
-            --limit "${{ inputs.limit }}"
+            --limit "${{ inputs.limit }}" \
+            --min-coverage "${{ inputs.min_coverage }}"
