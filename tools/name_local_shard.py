@@ -118,6 +118,13 @@ async def worker(ctx, queue: asyncio.Queue, out: list, stats: dict) -> None:
                     if stats["err"] + stats["blocked"] <= 6:
                         print(f"  ! {pid} try{attempt + 1}: {last} | url={url[:70]} title={title!r} "
                               f"blocked={blocked}", flush=True)
+                    # CONFIRMED 2026-08-24: the failures are google.com/sorry/ bot-detection,
+                    # not slow renders. Retrying a block is pure waste -- all 3 attempts hit
+                    # the same interstitial seconds apart. Give the outlet up immediately and
+                    # let the next pass collect it; ingest only re-stages NULLs, so nothing
+                    # is lost and the run finishes ~3x sooner on the blocked portion.
+                    if blocked:
+                        break
                     if attempt < 2:
                         await asyncio.sleep(3 * (attempt + 1))
             if res:
