@@ -12,12 +12,11 @@ name: name-local
 on:
   workflow_dispatch:
     inputs:
-      shards:      { required: true,  type: string, description: "comma-separated shard names" }
-      shard_base:  { required: true,  type: string, description: "blob URL prefix holding shards/<shard>.json (no SAS)" }
+      shards:      { required: true,  type: string, description: "comma-separated shard names (files in name_local_shards/)" }
       out_base:    { required: true,  type: string, description: "blob URL prefix for results (no SAS)" }
       concurrency: { required: false, type: string, default: "8", description: "pages per runner; raises per-IP rate" }
       limit:       { required: false, type: string, default: "0", description: "0 = whole shard" }
-      max_parallel:{ required: false, type: string, default: "20" }
+      max_parallel: { required: false, type: string, default: "20" }
 
 concurrency:
   group: name-local
@@ -56,12 +55,11 @@ jobs:
           python -m playwright install --with-deps chromium
       - name: Read names for shard
         env:
-          MEDIA_BLOB_READ_SAS: ${{ secrets.MEDIA_BLOB_READ_SAS }}
           MEDIA_BLOB_WRITE_SAS: ${{ secrets.MEDIA_BLOB_WRITE_SAS }}
           PHASE2_SHOT_BLOB_SAS: ${{ secrets.PHASE2_SHOT_BLOB_SAS }}
         run: |
           python tools/name_local_shard.py \
-            --shard-url "${{ inputs.shard_base }}/shards/${{ matrix.shard }}.json" \
+            --shard-file "name_local_shards/${{ matrix.shard }}.json" \
             --out-base "${{ inputs.out_base }}" \
             --shard "${{ matrix.shard }}" \
             --concurrency "${{ inputs.concurrency }}" \
