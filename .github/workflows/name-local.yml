@@ -1,0 +1,68 @@
+name: name-local
+
+# Name-only pass: read the <h1> and the secondary <h2> for a shard of place_ids.
+#
+# NOT a re-scrape. phase2-scrape rewrites place_data.data wholesale, which fires
+# scraper.tr_place_data_core and overwrites EVERY place_core column from the new scrape.
+# Running that across 47k outlets to obtain one field would risk degrading good data.
+# This reads two DOM nodes, writes only its own results file, and never touches the API.
+#
+# Results -> blob llm-batch/name_local/results/<shard>.jsonl, ingested by
+# clients/Flora/pipeline/ingest_name_local.py (targeted UPDATE of name_local only).
+on:
+  workflow_dispatch:
+    inputs:
+      shards:      { required: true,  type: string, description: "comma-separated shard names" }
+      shard_base:  { required: true,  type: string, description: "blob URL prefix holding shards/<shard>.json (no SAS)" }
+      out_base:    { required: true,  type: string, description: "blob URL prefix for results (no SAS)" }
+      concurrency: { required: false, type: string, default: "8", description: "pages per runner; raises per-IP rate" }
+      limit:       { required: false, type: string, default: "0", description: "0 = whole shard" }
+      max_parallel:{ required: false, type: string, default: "20" }
+
+concurrency:
+  group: name-local
+  cancel-in-progress: false
+
+jobs:
+  plan:
+    runs-on: ubuntu-22.04
+    outputs:
+      matrix: ${{ steps.mk.outputs.matrix }}
+    steps:
+      - id: mk
+        env:
+          SHARDS: ${{ inputs.shards }}
+        run: |
+          python3 -c 'import json,os; print("matrix=" + json.dumps([s.strip() for s in os.environ["SHARDS"].split(",") if s.strip()]))' >> "$GITHUB_OUTPUT"
+
+  names:
+    needs: plan
+    runs-on: ubuntu-22.04
+    timeout-minutes: 240
+    strategy:
+      fail-fast: false
+      max-parallel: ${{ fromJson(inputs.max_parallel) }}
+      matrix:
+        shard: ${{ fromJson(needs.plan.outputs.matrix) }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Install deps (Playwright only — NO DB driver)
+        run: |
+          python -m pip install --upgrade pip
+          pip install --quiet requests playwright
+          python -m playwright install --with-deps chromium
+      - name: Read names for shard
+        env:
+          MEDIA_BLOB_READ_SAS: ${{ secrets.MEDIA_BLOB_READ_SAS }}
+          MEDIA_BLOB_WRITE_SAS: ${{ secrets.MEDIA_BLOB_WRITE_SAS }}
+          PHASE2_SHOT_BLOB_SAS: ${{ secrets.PHASE2_SHOT_BLOB_SAS }}
+        run: |
+          python tools/name_local_shard.py \
+            --shard-url "${{ inputs.shard_base }}/shards/${{ matrix.shard }}.json" \
+            --out-base "${{ inputs.out_base }}" \
+            --shard "${{ matrix.shard }}" \
+            --concurrency "${{ inputs.concurrency }}" \
+            --limit "${{ inputs.limit }}"
