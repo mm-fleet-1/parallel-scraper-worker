@@ -30,6 +30,8 @@ import json
 import os
 import time
 
+from pathlib import Path
+
 import requests
 
 EXTRACT_JS = """
@@ -109,7 +111,12 @@ async def worker(ctx, queue: asyncio.Queue, out: list, stats: dict) -> None:
 
 async def main_async(a) -> None:
     from playwright.async_api import async_playwright
-    pids = json.loads(blob_get(a.shard_url))
+    if a.shard_file:
+        pids = json.loads(Path(a.shard_file).read_text(encoding="utf-8"))
+    elif a.shard_url:
+        pids = json.loads(blob_get(a.shard_url))
+    else:
+        raise SystemExit("need --shard-file or --shard-url")
     if a.limit:
         pids = pids[:a.limit]
     print(f"shard {a.shard}: {len(pids)} place_ids, concurrency={a.concurrency}", flush=True)
@@ -141,7 +148,11 @@ async def main_async(a) -> None:
 
 def main() -> None:
     ap = argparse.ArgumentParser()
-    ap.add_argument("--shard-url", required=True)
+    ap.add_argument("--shard-url", help="blob URL of the shard (needs MEDIA_BLOB_READ_SAS)")
+    ap.add_argument("--shard-file", help="local path to the shard JSON, committed in this repo. "
+                                         "Preferred: place_ids are public identifiers, so shipping "
+                                         "them in the repo avoids handing a delete-capable SAS to "
+                                         "19 public fleet repos just to read a list.")
     ap.add_argument("--out-base", required=True)
     ap.add_argument("--shard", required=True)
     ap.add_argument("--concurrency", type=int, default=8)
