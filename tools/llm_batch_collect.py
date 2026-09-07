@@ -4,7 +4,8 @@ For every Gemini batch job in this project whose display_name looks like "<clien
   * write/refresh a status stub   -> blob llm-batch/<client>/<dataset>/status/<shard>.json
   * if SUCCEEDED and not yet collected: download results -> blob .../results/<shard>.jsonl,
     then DELETE the Files-API input (frees the 20 GB per-project budget for the next wave)
-  * if FAILED / EXPIRED / CANCELLED: stub carries the error; input file deleted too
+  * if FAILED / EXPIRED / CANCELLED: stub carries the error and the input file is
+    KEPT (src_file + input_retained) so the job can be re-created without rebuilding
 Idempotent: "collected" == results blob exists (HEAD with the read SAS). Safe to run every few minutes.
 
 env: LLM_BATCH_GEMINI_KEY, MEDIA_BLOB_READ_SAS, MEDIA_BLOB_WRITE_SAS (falls back to PHASE2_SHOT_BLOB_SAS)
@@ -147,9 +148,19 @@ def sweep(a, client, rq, wq) -> dict:
             err = getattr(job, "error", None)
             stub["error"] = str(err)[:500] if err else state
             failed += 1
-        if (state == "JOB_STATE_SUCCEEDED" or state in TERMINAL_BAD) and not src:
+        # Only a SUCCEEDED job is finished with its input. A FAILED job is a retry
+        # candidate: Google fails batches for its own reasons (we saw
+        # "Failed to open database ... within deadline", an internal code 13), and
+        # deleting the input turns a free re-create into re-fetching thousands of
+        # images and rebuilding a 613 MB file. Keep inputs for TERMINAL_BAD so a retry
+        # can resubmit the file that already exists.
+        reusable = state in TERMINAL_BAD
+        if state == "JOB_STATE_SUCCEEDED" and not src:
             stub["input_deleted"] = True  # no file with that name left in the project
-        if (state == "JOB_STATE_SUCCEEDED" or state in TERMINAL_BAD) and src and not a.keep_inputs:
+        if reusable and src:
+            stub["input_retained"] = True
+            stub["src_file"] = src
+        if state == "JOB_STATE_SUCCEEDED" and src and not a.keep_inputs:
             try:
                 client.files.delete(name=src)
                 stub["input_deleted"] = True
