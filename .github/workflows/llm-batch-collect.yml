@@ -14,6 +14,7 @@ on:
     inputs:
       client:  { required: false, type: string, default: "" }
       dataset: { required: false, type: string, default: "" }
+      wait_minutes: { required: false, type: string, default: "0", description: "poll until every matching job is terminal (0 = one sweep)" }
 
 concurrency:
   group: llm-batch-collect
@@ -23,7 +24,7 @@ jobs:
   collect:
     if: ${{ github.event_name == 'workflow_dispatch' || vars.LLM_BATCH_ACTIVE == '1' }}
     runs-on: ubuntu-22.04
-    timeout-minutes: 30
+    timeout-minutes: 350
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -40,4 +41,5 @@ jobs:
           ARGS=""
           if [ -n "${{ inputs.client }}" ]; then ARGS="$ARGS --client ${{ inputs.client }}"; fi
           if [ -n "${{ inputs.dataset }}" ]; then ARGS="$ARGS --dataset ${{ inputs.dataset }}"; fi
+          if [ "${{ inputs.wait_minutes }}" != "0" ]; then ARGS="$ARGS --wait-minutes ${{ inputs.wait_minutes }}"; fi
           python tools/llm_batch_collect.py $ARGS
