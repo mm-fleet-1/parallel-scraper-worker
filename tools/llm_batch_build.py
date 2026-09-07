@@ -90,6 +90,9 @@ def fetch_resized(url: str, dim: int) -> bytes:
     raise RuntimeError(f"fetch failed {url}: {last}")
 
 
+DROPPED: list[str] = []   # every image we gave up on, for the sanity gate below
+
+
 def _fetch_or_none(url: str, dim: int, optional: bool) -> bytes | None:
     """Never let one bad image sink a whole shard: missing optional images and undecodable images are dropped
     (logged); only repeated transport failures on a required image still raise."""
@@ -102,11 +105,16 @@ def _fetch_or_none(url: str, dim: int, optional: bool) -> bytes | None:
         # a 100-outlet shard must not fail every outlet in it.
         # A 4xx on OUR blob is different -- that means a bad or expired SAS, a config
         # error we want loud rather than silently missing screenshots.
-        cdn_gone = BLOB_HOST not in url and re.search(r"HTTP 4\d\d", msg) is not None
-        if (optional or cdn_gone or "truncated" in msg or "cannot identify" in msg
+        # A public CDN image is NEVER fatal. It can 404 (expired gps-proxy link), 403
+        # (rate limit) or 500 (Google server error) -- one 500 out of 9,217 images killed
+        # a 1,705-outlet shard, and across 3.78M fetches that would kill every shard.
+        # Only OUR blob still raises: a failure there is a bad SAS, i.e. systematic.
+        cdn = BLOB_HOST not in url
+        if (optional or cdn or "truncated" in msg or "cannot identify" in msg
                 or "decoder" in msg.lower() or "HTTP 404" in msg):
-            why = "optional" if optional else "expired CDN url" if cdn_gone else "undecodable/missing"
-            print(f"  image dropped ({why}): {url.rsplit('/', 1)[-1][:60]} :: {msg[-60:]}")
+            why = "optional" if optional else "cdn unavailable" if cdn else "undecodable"
+            print(f"  image dropped ({why}): {url.rsplit('/', 1)[-1][:52]} :: {msg[-52:]}")
+            DROPPED.append(url)
             return None
         raise
 
@@ -236,6 +244,14 @@ def main() -> None:
                 n_img += k
             i = min(g + a.workers, len(skel))
             print(f"  built {i}/{len(skel)} ({n_img} images, {path.stat().st_size / 1e6:.0f} MB, {time.time() - t0:.0f}s)", flush=True)
+    # Tolerating single failures must not become tolerating all of them: a shard that
+    # lost most of its imagery would still "succeed" and be judged on nothing.
+    want = sum(len(x.get("images") or []) for x in skel)
+    if want and len(DROPPED) / want > 0.40:
+        raise SystemExit(f"aborting {a.shard}: {len(DROPPED)}/{want} images unfetchable "
+                         f"({100*len(DROPPED)/want:.0f}%) -- systematic, not transient")
+    print(f"images: {n_img} sent, {len(DROPPED)} dropped of {want} "
+          f"({100*len(DROPPED)/max(want,1):.1f}%)")
     size = path.stat().st_size
     print(f"built {path.name}: {size / 1e6:.0f} MB in {time.time() - t0:.0f}s")
 
