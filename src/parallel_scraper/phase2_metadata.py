@@ -569,7 +569,7 @@ class PlaywrightSession:
             logger.warning("phase2_session.media_capture_failed place_id=%s",
                            place_id, exc_info=True)
             return None
-        out = {"photo_dates": {k: hc.get(k) for k in ("place_photos", "imagery")}}
+        out = {"photo_dates": {k: hc.get(k) for k in ("place_photos", "imagery", "entry")}}
         out["photo_dates"]["errors"] = [e for e in hc["errors"] if e.startswith("place_photos")]
         if with_menu:
             out["horeca"] = {k: hc.get(k) for k in ("menu_link", "website", "menu_photos")}
