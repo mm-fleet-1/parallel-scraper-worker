@@ -153,7 +153,11 @@ async def _walk_viewer(page, sniffed: list[str], cap_items: int) -> list[dict]:
             break    # a lone Street View panorama: arrow keys move the camera
         n_before, key_before = len(sniffed), key
         await _click_next(page)
-        for _ in range(10):
+        # Wait up to ~8 s for the viewer to move. On slow fleet runners 3 s was not
+        # enough: the unchanged URL read as a repeat, 3 repeats ended the walk early
+        # (Forever Living: 26 in the grid, fleet walked 9) and re-clicking Next while
+        # the last slide was still loading skipped items. Fast loads still break at once.
+        for _ in range(26):
             await page.wait_for_timeout(300)
             if _photo_key(page.url) != key_before or len(sniffed) > n_before:
                 break
