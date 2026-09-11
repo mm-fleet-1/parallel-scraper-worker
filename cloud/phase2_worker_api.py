@@ -86,14 +86,19 @@ def _sink_photos(run_id, pid, image_urls):
         logger.warning("phase2.photo_sink_failed run_id=%s pid=%s", run_id, pid, exc_info=True)
 
 
-def _horeca_one(session, run_id, pid, row):
-    """HoReCa capture (PHASE2_HORECA=1): menu/photo dates + imagery on the still-open
-    panel. Result is embedded into `row` (rides the data JSON into place_data — no
-    API change); menu cards are mirrored to Blob. Best-effort: never fails the place."""
-    if not hasattr(session, "horeca_capture"):
+def _media_one(session, run_id, pid, row):
+    """Dated gallery walk on the still-open panel — EVERY place: row["photo_dates"]
+    = {place_photos[{url,date,kind}], imagery, errors}, all gallery items. With
+    PHASE2_HORECA=1 also row["horeca"] (menu cards, mirrored to Blob). Rides the
+    data JSON into place_data — no API change. Best-effort: never fails the place."""
+    if not hasattr(session, "media_capture"):
         return
     try:
-        hc = session.horeca_capture(pid)
+        m = session.media_capture(pid)
+        if not m:
+            return
+        row["photo_dates"] = m["photo_dates"]
+        hc = m.get("horeca")
         if not hc:
             return
         row["horeca"] = hc
@@ -105,13 +110,13 @@ def _horeca_one(session, run_id, pid, row):
                 logger.warning("phase2.menu_sink_failed run_id=%s pid=%s",
                                run_id, pid, exc_info=True)
     except Exception:
-        logger.warning("phase2.horeca_failed run_id=%s pid=%s", run_id, pid, exc_info=True)
+        logger.warning("phase2.media_failed run_id=%s pid=%s", run_id, pid, exc_info=True)
 
 
 def _panel_extras_one(session, run_id, pid):
     """Overview-pane capture (PHASE2_PANEL_EXTRAS=1). Returns a row for
     /phase2/attributes, or None when the toggle is off or nothing usable came
-    back. Runs AFTER _horeca_one: it re-navigates to the place URL, and the
+    back. Runs AFTER _media_one: it re-navigates to the place URL, and the
     gallery walk cannot survive that. Best-effort — these are additive fields and
     must never fail a place that already scraped fine."""
     if not hasattr(session, "panel_extras"):
@@ -260,7 +265,7 @@ def run_worker(run_id, shard, max_minutes=300, batch=20, state=None,
                     row = session.scrape(pid)
                     if not row or (row.get("name") or "") in ("", "FAILED"):
                         raise RuntimeError("blank-after-warmup / no data")
-                    _horeca_one(session, run_id, pid, row)   # before serializing
+                    _media_one(session, run_id, pid, row)   # before serializing
                     urls = _split_image_urls(row.get("image_urls"))
                     pend_done.append({"place_id": pid, "attempts": attempts,
                                       "data": json.dumps(row, default=str), "image_urls": urls})
@@ -312,7 +317,7 @@ def _scrape_one(session, run_id, pid, attempts, capture_shots, shot_state):
         row = session.scrape(pid)
         if not row or (row.get("name") or "") in ("", "FAILED"):
             raise RuntimeError("blank-after-warmup / no data")
-        _horeca_one(session, run_id, pid, row)   # before serializing
+        _media_one(session, run_id, pid, row)   # before serializing
         urls = _split_image_urls(row.get("image_urls"))
         done = {"place_id": pid, "attempts": attempts,
                 "data": json.dumps(row, default=str), "image_urls": urls}
