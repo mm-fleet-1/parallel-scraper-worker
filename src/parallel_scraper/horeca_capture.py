@@ -203,18 +203,14 @@ async def capture_horeca(page, photo_cap: int = PHOTO_CAP_DEFAULT, with_menu: bo
                 # Screenshot capture already leaves the page on Overview, and on the
                 # fleets a pane overlay can intercept the click for the full 30s.
                 if await ov.count() and await ov.get_attribute("aria-selected") != "true":
-                    try:
-                        await ov.click(timeout=3_000)
-                    except Exception:
-                        try:
-                            await ov.click(timeout=3_000, force=True)
-                        except Exception:
-                            pass
+                    # In-page click: a pointer click lands on the overlay instead.
+                    await ov.evaluate("e => e.click()")
                     await page.wait_for_timeout(2_000)
-                cover = page.locator(
-                    'button[aria-label^="Photo of"], button[jsaction*="heroHeaderImage"]').first
+                # Hero image only. A bare "Photo of ..." also matches reviewer
+                # avatars, which open a profile, not the gallery.
+                cover = page.locator('button[jsaction*="heroHeaderImage"]').first
                 if await cover.count():
-                    await cover.click()
+                    await cover.evaluate("e => e.click()")   # overlay-proof, see above
                     await page.wait_for_timeout(2_500)
                     entered = True
             if entered:
