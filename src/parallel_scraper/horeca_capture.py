@@ -87,6 +87,32 @@ _NEXT_DISABLED = """() => {
 }"""
 
 
+# Bring the LAST loaded thumbnail into view: the grid lazy-loads on intersection, so
+# setting scrollTop on containers did nothing, while scrollIntoView loaded the next
+# batch (20 -> 22) with the viewer still open. Escape is not an option — it tears the
+# whole gallery down (0 thumbnails left).
+_SCROLL_GRID = """() => {
+    const t = [...document.querySelectorAll('[data-photo-index]')];
+    if (!t.length) return 0;
+    t[t.length - 1].scrollIntoView({block: 'end'});
+    return t.length;
+}"""
+
+
+async def _load_more(page) -> bool:
+    """The 'See photos' grid lazy-loads ~10 thumbnails at a time and the viewer can
+    only page through loaded ones, so Next turns off at item 10 until the grid is
+    scrolled (fleet: 546 listings stopped at exactly 10 of 22-40). Scroll it and wait
+    for Next to come back; False = the real end of the gallery."""
+    if not await page.evaluate(_SCROLL_GRID):
+        return False
+    for _ in range(8):
+        await page.wait_for_timeout(500)
+        if not await page.evaluate(_NEXT_DISABLED):
+            return True
+    return False
+
+
 def _photo_key(href: str) -> str:
     """The viewer URL carries the current item's id (`!1s<id>`); it changes on
     every Next whether or not the image comes over the network."""
@@ -147,7 +173,7 @@ async def _walk_viewer(page, sniffed: list[str], cap_items: int) -> list[dict]:
                 items.append({"url": None, "date": attr, "kind": "street_view"})
         if cap_items and len(items) >= cap_items:
             break
-        if await page.evaluate(_NEXT_DISABLED):
+        if await page.evaluate(_NEXT_DISABLED) and not await _load_more(page):
             break
         if not await page.locator('button[aria-label*="Next" i]').count():
             break    # a lone Street View panorama: arrow keys move the camera
