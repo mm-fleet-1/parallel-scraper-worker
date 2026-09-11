@@ -76,21 +76,49 @@ async def _click_next(page) -> None:
     await page.keyboard.press("ArrowRight")
 
 
+_NEXT_DISABLED = """() => {
+    const b = document.querySelector('button[aria-label*="Next" i]');
+    return !!(b && (b.disabled || b.getAttribute('aria-disabled') === 'true'));
+}"""
+
+
+def _photo_key(href: str) -> str:
+    """The viewer URL carries the current item's id (`!1s<id>`); it changes on
+    every Next whether or not the image comes over the network."""
+    m = re.search(r"!1s([^!]+)", href or "")
+    return m.group(1) if m else (href or "")
+
+
 async def _walk_viewer(page, sniffed: list[str], cap_items: int) -> list[dict]:
     """Walk the open gallery viewer, one dict per item: {url, date, kind}.
-    cap_items=0 walks to the end (3 repeated slides = end of gallery)."""
+    cap_items=0 walks to the end: Next disabled is the end of the gallery.
+
+    Item identity is the viewer URL, not the sniffed image URL. Sniff-based
+    identity stalled when images arrived late (or not at all): two same-month
+    captions then looked identical and the walk stopped at ~10 of 29."""
     items: list[dict] = []
     seen: set[str] = set()
     stale = 0
+    # The first item can render late (a Street View canvas draws its "Image
+    # capture" caption after the viewer opens). Reading too early saw nothing,
+    # pressed Next into an empty panorama and gave up with zero items.
+    for _ in range(8):
+        got = await page.evaluate(_EVAL_CURRENT_ITEM)
+        if got.get("img") or got.get("cap") or got.get("attr") or sniffed:
+            break
+        await page.wait_for_timeout(500)
+    n_sniff_used = 0
     for _ in range(cap_items * 2 if cap_items else _WALK_GUARD):
         got = await page.evaluate(_EVAL_CURRENT_ITEM)
+        key = _photo_key(page.url)
         src, cap, attr = got.get("img"), got.get("cap"), got.get("attr")
-        if not src and sniffed:
-            src = sniffed[-1]
+        if not src and len(sniffed) > n_sniff_used:
+            src = sniffed[-1]           # only an image that arrived for THIS step
+        n_sniff_used = len(sniffed)
         is_video = bool(cap and cap.lower().startswith("video"))
         if is_video:
             src = None
-        sig = f"{cap}|{got.get('vid')}|{(src or '').split('=')[0]}"
+        sig = f"{key}|{cap}|{got.get('vid')}"
         if sig in seen:
             stale += 1
             if stale >= 3:
@@ -100,23 +128,29 @@ async def _walk_viewer(page, sniffed: list[str], cap_items: int) -> list[dict]:
             stale = 0
             if is_video:
                 items.append({"url": None, "date": cap, "kind": "video"})
+            elif cap:
+                is_sv = bool(src and "streetviewpixels" in src)
+                items.append({"url": src, "date": cap,
+                              "kind": "street_view" if is_sv else "photo"})
             elif src:
-                is_sv = "streetviewpixels" in src or (not cap and bool(attr))
-                items.append({"url": src, "date": cap or attr,
+                is_sv = "streetviewpixels" in src or bool(attr)
+                items.append({"url": src, "date": attr,
                               "kind": "street_view" if is_sv else "photo"})
             elif attr:
-                # Cover is a Street View panorama (canvas, no <img>, no Next): the
-                # listing has no photo gallery. Keep the capture date and stop —
-                # arrow keys here move the camera, not the gallery.
+                # Street View item with no <img>: either the cover of a listing with
+                # no photo gallery (no Next -> stop below) or the last gallery item.
                 items.append({"url": None, "date": attr, "kind": "street_view"})
-                break
         if cap_items and len(items) >= cap_items:
             break
-        n_before = len(sniffed)
+        if await page.evaluate(_NEXT_DISABLED):
+            break
+        if not await page.locator('button[aria-label*="Next" i]').count():
+            break    # a lone Street View panorama: arrow keys move the camera
+        n_before, key_before = len(sniffed), key
         await _click_next(page)
-        for _ in range(8):
-            await page.wait_for_timeout(500)
-            if len(sniffed) > n_before:
+        for _ in range(10):
+            await page.wait_for_timeout(300)
+            if _photo_key(page.url) != key_before or len(sniffed) > n_before:
                 break
     return items
 
@@ -198,6 +232,7 @@ async def capture_horeca(page, photo_cap: int = PHOTO_CAP_DEFAULT, with_menu: bo
                 await thumbs2.first.click()
                 await page.wait_for_timeout(2_000)
                 entered = True
+                out["entry"] = "menu_thumbs"
             else:
                 ov = page.get_by_role("tab", name=re.compile("^Overview", re.I)).first
                 # Screenshot capture already leaves the page on Overview, and on the
@@ -206,13 +241,19 @@ async def capture_horeca(page, photo_cap: int = PHOTO_CAP_DEFAULT, with_menu: bo
                     # In-page click: a pointer click lands on the overlay instead.
                     await ov.evaluate("e => e.click()")
                     await page.wait_for_timeout(2_000)
-                # Hero image only. A bare "Photo of ..." also matches reviewer
-                # avatars, which open a profile, not the gallery.
+                # "See photos" opens the FULL gallery (viewer on item 1, Next walks
+                # every photo). The hero image can open a ~10-item preview carousel
+                # instead — Akansha Medical: hero 10, See photos 29. Hero is only the
+                # fallback. Never a bare "Photo of ...": that matches reviewer avatars.
+                see = page.locator("button:has-text('See photos')").first
                 cover = page.locator('button[jsaction*="heroHeaderImage"]').first
-                if await cover.count():
-                    await cover.evaluate("e => e.click()")   # overlay-proof, see above
-                    await page.wait_for_timeout(2_500)
-                    entered = True
+                for name, entry, wait_ms in (("see_photos", see, 3_000), ("hero", cover, 2_500)):
+                    if await entry.count():
+                        await entry.evaluate("e => e.click()")   # overlay-proof, see above
+                        await page.wait_for_timeout(wait_ms)
+                        entered = True
+                        out["entry"] = name   # hero = possible ~10-item preview
+                        break
             if entered:
                 allchip = page.get_by_role("tab", name=re.compile("^All$", re.I)).first
                 if await allchip.count():
