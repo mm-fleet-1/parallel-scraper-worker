@@ -22,7 +22,9 @@ import re
 
 logger = logging.getLogger(__name__)
 
-PHOTO_CAP_DEFAULT = 12
+PHOTO_CAP_DEFAULT = 12        # menu cards (horeca=1 only)
+PLACE_PHOTO_CAP_DEFAULT = 0   # place-photo date walk: 0 = every item in the gallery
+_WALK_GUARD = 5000            # loop guard for the uncapped walk, not a data cap
 
 _EVAL_CURRENT_ITEM = """() => {
     let best = null, bestA = 0;
@@ -59,6 +61,10 @@ _EVAL_STRIP_SRCS = """() => {
 }"""
 
 
+class _Skip(Exception):
+    """Section switched off — not an error, nothing recorded."""
+
+
 async def _click_next(page) -> None:
     nxt = page.locator('button[aria-label*="Next" i]').first
     try:
@@ -71,11 +77,12 @@ async def _click_next(page) -> None:
 
 
 async def _walk_viewer(page, sniffed: list[str], cap_items: int) -> list[dict]:
-    """Walk the open gallery viewer, one dict per item: {url, date, kind}."""
+    """Walk the open gallery viewer, one dict per item: {url, date, kind}.
+    cap_items=0 walks to the end (3 repeated slides = end of gallery)."""
     items: list[dict] = []
     seen: set[str] = set()
     stale = 0
-    for _ in range(cap_items * 2):
+    for _ in range(cap_items * 2 if cap_items else _WALK_GUARD):
         got = await page.evaluate(_EVAL_CURRENT_ITEM)
         src, cap, attr = got.get("img"), got.get("cap"), got.get("attr")
         if not src and sniffed:
@@ -97,7 +104,7 @@ async def _walk_viewer(page, sniffed: list[str], cap_items: int) -> list[dict]:
                 is_sv = "streetviewpixels" in src or (not cap and bool(attr))
                 items.append({"url": src, "date": cap or attr,
                               "kind": "street_view" if is_sv else "photo"})
-        if len(items) >= cap_items:
+        if cap_items and len(items) >= cap_items:
             break
         n_before = len(sniffed)
         await _click_next(page)
@@ -108,11 +115,17 @@ async def _walk_viewer(page, sniffed: list[str], cap_items: int) -> list[dict]:
     return items
 
 
-async def capture_horeca(page, photo_cap: int = PHOTO_CAP_DEFAULT) -> dict:
+async def capture_horeca(page, photo_cap: int = PHOTO_CAP_DEFAULT, with_menu: bool = True,
+                         place_photo_cap: int = PLACE_PHOTO_CAP_DEFAULT) -> dict:
     """Capture menu/photo/date/imagery data from the place panel currently on
-    `page`. Never raises — every section degrades to empty + an errors entry."""
+    `page`. Never raises — every section degrades to empty + an errors entry.
+
+    with_menu=False skips links + the Menu tab and only walks the place-photo
+    gallery (the always-on photo-date capture). Order is unchanged when on:
+    menu first, then the gallery re-entered through the menu thumbs."""
     out: dict = {"menu_link": None, "website": None, "menu_photos": [],
                  "place_photos": [], "imagery": None, "errors": []}
+    menu_walked = False
 
     sniffed: list[str] = []
 
@@ -127,19 +140,23 @@ async def capture_horeca(page, photo_cap: int = PHOTO_CAP_DEFAULT) -> dict:
     try:
         # links from the overview panel
         try:
+            if not with_menu:
+                raise _Skip
             el = page.locator('a[data-item-id="menu"]').first
             if await el.count():
                 out["menu_link"] = await el.get_attribute("href")
             ws = page.locator('a[data-item-id="authority"]').first
             if await ws.count():
                 out["website"] = await ws.get_attribute("href")
+        except _Skip:
+            pass
         except Exception as e:
             out["errors"].append(f"links: {e}")
 
         # menu tab: filmstrip srcs + dated walk
         try:
             tab = page.get_by_role("tab", name=re.compile("^Menu", re.I)).first
-            if await tab.count():
+            if with_menu and await tab.count():
                 await tab.click()
                 await page.wait_for_timeout(2_500)
                 thumbs = page.locator('button[aria-label^="Photo "]')
@@ -148,6 +165,7 @@ async def capture_horeca(page, photo_cap: int = PHOTO_CAP_DEFAULT) -> dict:
                     m = re.search(r"of (\d+)", aria0)
                     total = min(int(m.group(1)) if m else await thumbs.count(), photo_cap)
                     await thumbs.first.click()
+                    menu_walked = True
                     await page.wait_for_timeout(2_000)
                     strip = await page.evaluate(_EVAL_STRIP_SRCS)
                     dates = []
@@ -167,8 +185,10 @@ async def capture_horeca(page, photo_cap: int = PHOTO_CAP_DEFAULT) -> dict:
         # place photos: re-enter gallery (menu thumbs if present, else cover)
         try:
             entered = False
+            # Menu thumbs only exist after a menu walk; without one, a "Photo "
+            # button on the Reviews pane is a reviewer photo, so go via the cover.
             thumbs2 = page.locator('button[aria-label^="Photo "]')
-            if await thumbs2.count():
+            if menu_walked and await thumbs2.count():
                 await thumbs2.first.click()
                 await page.wait_for_timeout(2_000)
                 entered = True
@@ -188,7 +208,7 @@ async def capture_horeca(page, photo_cap: int = PHOTO_CAP_DEFAULT) -> dict:
                 if await allchip.count():
                     await allchip.click()
                     await page.wait_for_timeout(2_000)
-                out["place_photos"] = await _walk_viewer(page, sniffed, photo_cap)
+                out["place_photos"] = await _walk_viewer(page, sniffed, place_photo_cap)
                 await page.keyboard.press("Escape")
             real = sum(1 for p in out["place_photos"] if p["kind"] in ("photo", "video"))
             sv = sum(1 for p in out["place_photos"] if p["kind"] == "street_view")
