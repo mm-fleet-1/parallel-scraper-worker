@@ -23,10 +23,12 @@ import re
 logger = logging.getLogger(__name__)
 
 PHOTO_CAP_DEFAULT = 12        # menu cards (horeca=1 only)
-# place-photo date walk cap. 1000 keeps the biggest walks (~12 min at ~0.7s/item) inside
-# the 30-min lease: an uncapped 13k-photo hypermarket (~2.5 h) was reclaimed 5x and marked
-# failed, losing its row. 0 = no cap (env PHASE2_PHOTO_DATES_CAP overrides).
-PLACE_PHOTO_CAP_DEFAULT = 1000
+# place-photo date walk cap. The dates feed the Phase 3 vision pass (pick recent
+# storefront/shelf shots), so a pool of 20 is enough; ~85% of target outlets have <=20
+# photos and are dated in full. Also keeps every walk far inside the 30-min lease (an
+# uncapped 13k-photo hypermarket took ~2.5 h and was marked failed). NB gallery order is
+# Google's, not newest-first. 0 = no cap; env PHASE2_PHOTO_DATES_CAP overrides.
+PLACE_PHOTO_CAP_DEFAULT = 20
 _WALK_GUARD = 5000            # loop guard for the uncapped walk, not a data cap
 
 _EVAL_CURRENT_ITEM = """() => {
