@@ -543,28 +543,47 @@ class PlaywrightSession:
                            place_id, exc_info=True)
             return None
 
-    def horeca_capture(self, place_id: str, photo_cap: int | None = None) -> Optional[dict]:
-        """HoReCa menu/photo/date/imagery capture on the CURRENT page — call
-        right after scrape(place_id) while the panel is still open. Gated by
-        env PHASE2_HORECA=1; returns the capture dict or None when off/dead.
-        Never raises (capture_horeca degrades per-section)."""
+    def media_capture(self, place_id: str) -> Optional[dict]:
+        """Dated gallery walk on the CURRENT page — call right after
+        scrape(place_id) while the panel is still open. ALWAYS on: every place
+        gets {"photo_dates": {place_photos, imagery, errors}}. With env
+        PHASE2_HORECA=1 the Menu tab is walked first and {"horeca": {...menu}}
+        is added. PHASE2_PHOTO_DATES_CAP (default 0 = all) / PHASE2_HORECA_PHOTO_CAP
+        (menu, default 12). Returns None only when the page is dead; never raises."""
         import os as _os
-        if _os.environ.get("PHASE2_HORECA", "0") != "1":
-            return None
         if not self._page_alive():
             return None
-        from parallel_scraper.horeca_capture import PHOTO_CAP_DEFAULT, capture_horeca
-        cap = int(photo_cap or _os.environ.get("PHASE2_HORECA_PHOTO_CAP", PHOTO_CAP_DEFAULT))
+        from parallel_scraper.horeca_capture import (PHOTO_CAP_DEFAULT,
+                                                     PLACE_PHOTO_CAP_DEFAULT, capture_horeca)
+        with_menu = _os.environ.get("PHASE2_HORECA", "0") == "1"
+        menu_cap = int(_os.environ.get("PHASE2_HORECA_PHOTO_CAP", PHOTO_CAP_DEFAULT))
+        place_cap = int(_os.environ.get("PHASE2_PHOTO_DATES_CAP", PLACE_PHOTO_CAP_DEFAULT))
 
         async def _do() -> dict:
-            return await capture_horeca(self._page, photo_cap=cap)
+            return await capture_horeca(self._page, photo_cap=menu_cap, with_menu=with_menu,
+                                        place_photo_cap=place_cap)
 
         try:
-            return self._loop.run_until_complete(_do())
+            hc = self._loop.run_until_complete(_do())
         except Exception:
-            logger.warning("phase2_session.horeca_capture_failed place_id=%s",
+            logger.warning("phase2_session.media_capture_failed place_id=%s",
                            place_id, exc_info=True)
             return None
+        out = {"photo_dates": {k: hc.get(k) for k in ("place_photos", "imagery")}}
+        out["photo_dates"]["errors"] = [e for e in hc["errors"] if e.startswith("place_photos")]
+        if with_menu:
+            out["horeca"] = {k: hc.get(k) for k in ("menu_link", "website", "menu_photos")}
+            out["horeca"]["errors"] = [e for e in hc["errors"]
+                                       if not e.startswith("place_photos")]
+        return out
+
+    def horeca_capture(self, place_id: str, photo_cap: int | None = None) -> Optional[dict]:
+        """Old combined shape for the local tools (rescrape/probe/smoke test)."""
+        m = self.media_capture(place_id)
+        if not m:
+            return None
+        return {**(m.get("horeca") or {}), **m["photo_dates"],
+                "errors": (m.get("horeca") or {}).get("errors", []) + m["photo_dates"]["errors"]}
 
     def screenshot_paths(self, place_id: str) -> dict:
         """Return {kind: png_path} for the panel screenshots captured for this place
