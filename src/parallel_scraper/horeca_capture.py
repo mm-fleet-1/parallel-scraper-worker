@@ -23,7 +23,10 @@ import re
 logger = logging.getLogger(__name__)
 
 PHOTO_CAP_DEFAULT = 12        # menu cards (horeca=1 only)
-PLACE_PHOTO_CAP_DEFAULT = 0   # place-photo date walk: 0 = every item in the gallery
+# place-photo date walk cap. 1000 keeps the biggest walks (~12 min at ~0.7s/item) inside
+# the 30-min lease: an uncapped 13k-photo hypermarket (~2.5 h) was reclaimed 5x and marked
+# failed, losing its row. 0 = no cap (env PHASE2_PHOTO_DATES_CAP overrides).
+PLACE_PHOTO_CAP_DEFAULT = 1000
 _WALK_GUARD = 5000            # loop guard for the uncapped walk, not a data cap
 
 _EVAL_CURRENT_ITEM = """() => {
