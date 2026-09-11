@@ -104,6 +104,12 @@ async def _walk_viewer(page, sniffed: list[str], cap_items: int) -> list[dict]:
                 is_sv = "streetviewpixels" in src or (not cap and bool(attr))
                 items.append({"url": src, "date": cap or attr,
                               "kind": "street_view" if is_sv else "photo"})
+            elif attr:
+                # Cover is a Street View panorama (canvas, no <img>, no Next): the
+                # listing has no photo gallery. Keep the capture date and stop —
+                # arrow keys here move the camera, not the gallery.
+                items.append({"url": None, "date": attr, "kind": "street_view"})
+                break
         if cap_items and len(items) >= cap_items:
             break
         n_before = len(sniffed)
@@ -194,8 +200,16 @@ async def capture_horeca(page, photo_cap: int = PHOTO_CAP_DEFAULT, with_menu: bo
                 entered = True
             else:
                 ov = page.get_by_role("tab", name=re.compile("^Overview", re.I)).first
-                if await ov.count():
-                    await ov.click()
+                # Screenshot capture already leaves the page on Overview, and on the
+                # fleets a pane overlay can intercept the click for the full 30s.
+                if await ov.count() and await ov.get_attribute("aria-selected") != "true":
+                    try:
+                        await ov.click(timeout=3_000)
+                    except Exception:
+                        try:
+                            await ov.click(timeout=3_000, force=True)
+                        except Exception:
+                            pass
                     await page.wait_for_timeout(2_000)
                 cover = page.locator(
                     'button[aria-label^="Photo of"], button[jsaction*="heroHeaderImage"]').first
