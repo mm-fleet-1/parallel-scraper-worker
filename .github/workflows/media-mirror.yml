@@ -1,0 +1,60 @@
+name: media-mirror
+
+# Generic: copy expiring media URLs (Google photo CDN, Street View) to our own blob so a
+# client deliverable can keep showing them. Reads client-written manifest shards from blob,
+# writes <dest_base>/<key>/<name> plus a per-shard result file the caller reads back.
+# Manual dispatch only.
+on:
+  workflow_dispatch:
+    inputs:
+      client:        { required: true,  type: string, description: "client id, e.g. loreal" }
+      dataset:       { required: true,  type: string, description: "dataset id, e.g. surat" }
+      shards:        { required: true,  type: string, description: "comma-separated shard names, e.g. shard_001,shard_002" }
+      manifest_base: { required: true,  type: string, description: "blob URL prefix holding <shard>.jsonl (no SAS)" }
+      dest_base:     { required: true,  type: string, description: "blob URL prefix to write <key>/<name> under (no SAS)" }
+      dim:           { required: false, type: string, default: "0", description: "longest side in px; 0 stores bytes as fetched" }
+      workers:       { required: false, type: string, default: "16", description: "concurrent fetches per shard" }
+      max_parallel:  { required: false, type: string, default: "13" }
+
+concurrency:
+  group: media-mirror-${{ inputs.client }}-${{ inputs.dataset }}
+  cancel-in-progress: false
+
+jobs:
+  plan:
+    runs-on: ubuntu-22.04
+    outputs:
+      matrix: ${{ steps.mk.outputs.matrix }}
+    steps:
+      - id: mk
+        env:
+          SHARDS: ${{ inputs.shards }}
+        run: |
+          python3 -c 'import json,os; print("matrix=" + json.dumps([s.strip() for s in os.environ["SHARDS"].split(",") if s.strip()]))' >> "$GITHUB_OUTPUT"
+
+  mirror:
+    needs: plan
+    runs-on: ubuntu-22.04
+    timeout-minutes: 120
+    strategy:
+      fail-fast: false
+      max-parallel: ${{ fromJson(inputs.max_parallel) }}
+      matrix:
+        shard: ${{ fromJson(needs.plan.outputs.matrix) }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - run: pip install --quiet requests pillow
+      - name: Mirror this shard's media to blob
+        env:
+          MEDIA_BLOB_READ_SAS: ${{ secrets.MEDIA_BLOB_READ_SAS }}
+          MEDIA_BLOB_WRITE_SAS: ${{ secrets.MEDIA_BLOB_WRITE_SAS }}
+          PHASE2_SHOT_BLOB_SAS: ${{ secrets.PHASE2_SHOT_BLOB_SAS }}
+        run: |
+          python tools/media_mirror.py \
+            --manifest-url "${{ inputs.manifest_base }}/${{ matrix.shard }}.jsonl" \
+            --dest-base "${{ inputs.dest_base }}" \
+            --shard "${{ matrix.shard }}" \
+            --dim "${{ inputs.dim }}" --workers "${{ inputs.workers }}"
