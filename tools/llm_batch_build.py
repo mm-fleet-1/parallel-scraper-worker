@@ -147,16 +147,50 @@ def row_prompt(sk: dict, template: str | None) -> str:
     return template.replace(PROMPT_PLACEHOLDER, sk.get("meta") or "", 1)
 
 
+def stamp_number(data: bytes, k: int) -> bytes:
+    """Burn the image's number into its top-left corner. With 20+ images per request, labels in the
+    prompt alone let per-image answers drift off by one or more (L'Oreal pilot: 20 of 24 entries
+    returned, misaligned from image 10); stamped numbers brought 4 of 4 long sets back complete."""
+    from PIL import ImageDraw, ImageFont
+    im = Image.open(BytesIO(data)).convert("RGB")
+    s = max(28, min(im.size) // 9)
+    dr = ImageDraw.Draw(im)
+    font = ImageFont.load_default(size=s)
+    w = dr.textlength(str(k), font=font)
+    dr.rectangle([0, 0, w + s * 0.6, s * 1.4], fill="black")
+    dr.text((s * 0.3, s * 0.15), str(k), fill="yellow", font=font)
+    buf = BytesIO()
+    im.save(buf, "JPEG", quality=90)
+    return buf.getvalue()
+
+
 def build_line(sk: dict, dim: int, pool: ThreadPoolExecutor,
                template: str | None = None) -> tuple[bytes, int]:
     parts = [{"text": row_prompt(sk, template)}]
     urls = sk.get("images") or []
     optional = set(sk.get("optional_images") or [])   # e.g. a listing screenshot: skip if gone, never fail the shard
-    imgs = [b for b in pool.map(lambda u: _fetch_or_none(u, dim, u in optional), urls) if b is not None]
-    for b in imgs:
+    # Optional, per skeleton line (older skeletons carry neither and build exactly as before):
+    #   labels: one text part sent immediately BEFORE each image ("Image 7: photo, posted 2026-03")
+    #   stamp:  burn the 1-based image number onto the pixels
+    labels = sk.get("labels") or []
+    stamp = bool(sk.get("stamp"))
+    fetched = list(pool.map(lambda u: _fetch_or_none(u, dim, u in optional), urls))
+    sent = 0
+    for i, b in enumerate(fetched):
+        label = labels[i] if i < len(labels) else ""
+        if b is None:
+            # keep the numbering: a dropped image must not shift every later label and stamp
+            if label:
+                parts.append({"text": f"{label} -- unavailable, not sent"})
+            continue
+        if stamp:
+            b = stamp_number(b, i + 1)
+        if label:
+            parts.append({"text": label})
         parts.append({"inlineData": {"mimeType": "image/jpeg", "data": base64.b64encode(b).decode("ascii")}})
+        sent += 1
     req = {"contents": [{"parts": parts}], "generationConfig": sk.get("generation_config") or {}}
-    return (json.dumps({"key": sk["key"], "request": req}, ensure_ascii=False) + "\n").encode("utf-8"), len(imgs)
+    return (json.dumps({"key": sk["key"], "request": req}, ensure_ascii=False) + "\n").encode("utf-8"), sent
 
 
 def normalise_thinking(model: str, gen: dict, key: str) -> dict:
