@@ -83,6 +83,8 @@ def sweep(a, client, rq, wq) -> dict:
     except Exception as exc:  # noqa: BLE001
         print(f"files.list failed: {str(exc)[:120]}")
     seen = collected = failed = unfinished = 0
+    fully_done: list[str] = []
+    datasets: set = set()
     # A shard can be re-dispatched (new job, same display_name); only the NEWEST job per name is authoritative.
     by_name: dict[str, list] = {}
     for job in client.batches.list():
@@ -173,9 +175,30 @@ def sweep(a, client, rq, wq) -> dict:
         if state != "JOB_STATE_SUCCEEDED" and state not in TERMINAL_BAD:
             unfinished += 1
         blob_put(status_url, json.dumps(stub).encode("utf-8"), wq)
+        if state == "JOB_STATE_SUCCEEDED" and stub.get("results_url") and stub.get("input_deleted"):
+            fully_done.append(job.name)
+        datasets.add((cl, ds))
         print(f"{dn:48} {state:24} pending={stub['pending_request_count']} collected={'yes' if stub['results_url'] else 'no'} input_deleted={stub['input_deleted']}")
+    # Cleanup (2026-09-17): once EVERY job of this client/dataset in this project is collected, delete the
+    # finished batch jobs (their results + status stubs are on blob) and the cached-prompt-mode cache, which
+    # bills storage per hour. Failed jobs are kept (retry candidates), so nothing is deleted while any exist.
+    cleaned = {"jobs_deleted": 0, "caches_deleted": 0}
+    if a.client and a.dataset and unfinished == 0 and failed == 0 and seen and len(fully_done) == seen             and not a.keep_inputs:
+        for name in fully_done:
+            try:
+                client.batches.delete(name=name)
+                cleaned["jobs_deleted"] += 1
+            except Exception as exc:  # noqa: BLE001
+                print(f"  batches.delete({name}) failed: {str(exc)[:120]}")
+        try:
+            for c in client.caches.list():
+                if c.display_name == f"{a.client}/{a.dataset}/system":
+                    client.caches.delete(name=c.name)
+                    cleaned["caches_deleted"] += 1
+        except Exception as exc:  # noqa: BLE001
+            print(f"  cache cleanup failed: {str(exc)[:120]}")
     out = {"jobs_seen": seen, "newly_collected": collected, "failed": failed,
-           "unfinished": unfinished, "checked_at": now}
+           "unfinished": unfinished, "checked_at": now, **cleaned}
     print(json.dumps(out))
     return out
 
