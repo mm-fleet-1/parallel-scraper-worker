@@ -138,6 +138,34 @@ def shard_prompt(skeleton_url: str) -> str | None:
     return r.text if r.status_code == 200 else None
 
 
+def shard_system(skeleton_url: str) -> str | None:
+    """<skeleton_base>/system_prompt.txt -> CACHED-prompt mode (added 2026-09-17, KW Batch 2/3).
+
+    The fixed instructions go into ONE explicit Gemini cache per project (client/dataset) and every
+    request carries cachedContent + its own images + its metadata as the LAST text part. Measured: implicit
+    caching gave 0 cached tokens on KW Batch 1 (per-outlet metadata sat inside the prompt); explicit caching
+    inside Batch API jobs cached 4,329-4,883 tokens per request ($0.02/M instead of $0.15/M).
+    """
+    base = skeleton_url.rsplit("/", 1)[0]
+    r = requests.get(signed(f"{base}/system_prompt.txt"), timeout=60)
+    return r.text if r.status_code == 200 else None
+
+
+def project_cache(client, types, model: str, display: str, system: str) -> str:
+    """Reuse this project's live cache for client/dataset if it outlives a batch (>26h left), else create one.
+    One cache per project, not per shard: storage bills per token-hour."""
+    import datetime as dt
+    now = dt.datetime.now(dt.timezone.utc)
+    for c in client.caches.list():
+        if c.display_name == display and c.expire_time and c.expire_time - now > dt.timedelta(hours=26):
+            print(f"  reusing cache {c.name} (expires {c.expire_time})")
+            return c.name
+    c = client.caches.create(model=model, config=types.CreateCachedContentConfig(
+        system_instruction=system, display_name=display, ttl="172800s"))
+    print(f"  created cache {c.name} ({getattr(c.usage_metadata, 'total_token_count', '?')} tokens, 48h)")
+    return c.name
+
+
 def row_prompt(sk: dict, template: str | None) -> str:
     """Row carries either a full prompt (old shards) or just its metadata block."""
     if sk.get("prompt"):
@@ -165,8 +193,9 @@ def stamp_number(data: bytes, k: int) -> bytes:
 
 
 def build_line(sk: dict, dim: int, pool: ThreadPoolExecutor,
-               template: str | None = None) -> tuple[bytes, int]:
-    parts = [{"text": row_prompt(sk, template)}]
+               template: str | None = None, cache: str | None = None) -> tuple[bytes, int]:
+    # cached mode: no prompt text up front -- images first, the row's metadata LAST (see shard_system)
+    parts = [] if cache else [{"text": row_prompt(sk, template)}]
     urls = sk.get("images") or []
     optional = set(sk.get("optional_images") or [])   # e.g. a listing screenshot: skip if gone, never fail the shard
     # Optional, per skeleton line (older skeletons carry neither and build exactly as before):
@@ -189,7 +218,13 @@ def build_line(sk: dict, dim: int, pool: ThreadPoolExecutor,
             parts.append({"text": label})
         parts.append({"inlineData": {"mimeType": "image/jpeg", "data": base64.b64encode(b).decode("ascii")}})
         sent += 1
-    req = {"contents": [{"parts": parts}], "generationConfig": sk.get("generation_config") or {}}
+    if cache:
+        parts.append({"text": sk.get("meta") or ""})
+    if not parts:
+        parts = [{"text": sk.get("meta") or ""}]
+    req = {"contents": [{"role": "user", "parts": parts}], "generationConfig": sk.get("generation_config") or {}}
+    if cache:
+        req["cachedContent"] = cache
     return (json.dumps({"key": sk["key"], "request": req}, ensure_ascii=False) + "\n").encode("utf-8"), sent
 
 
@@ -254,8 +289,23 @@ def main() -> None:
     r = requests.get(signed(a.skeleton_url), timeout=120)
     r.raise_for_status()
     skel = [json.loads(ln) for ln in r.text.splitlines() if ln.strip()]
-    template = None if all(x.get("prompt") for x in skel) else shard_prompt(a.skeleton_url)
-    print(f"skeleton {a.shard}: {len(skel)} requests, {sum(len(s.get('images') or []) for s in skel)} images")
+    system = shard_system(a.skeleton_url)
+    template = None if (system or all(x.get("prompt") for x in skel)) else shard_prompt(a.skeleton_url)
+    print(f"skeleton {a.shard}: {len(skel)} requests, {sum(len(s.get('images') or []) for s in skel)} images"
+          f"{' [cached-prompt mode]' if system else ''}")
+    cache = None
+    if system:
+        from google import genai as _g
+        from google.genai import types as _t
+        cache = project_cache(_g.Client(api_key=key), _t, a.model, f"{a.client}/{a.dataset}/system", system)
+    # Shard-level generationConfig (<base>/generation_config.json) for rows that carry none: a response
+    # schema repeated on every row would add ~5 KB x rows to the skeleton upload (2026-09-17).
+    rg = requests.get(signed(a.skeleton_url.rsplit("/", 1)[0] + "/generation_config.json"), timeout=60)
+    if rg.status_code == 200:
+        shard_gen = rg.json()
+        for s in skel:
+            s.setdefault("generation_config", shard_gen)
+        print(f"  shard generation_config: {sorted(shard_gen)}")
     gen0 = next((s.get("generation_config") for s in skel if s.get("generation_config")), None)
     if gen0:
         fixed = normalise_thinking(a.model, gen0, key)
@@ -273,7 +323,7 @@ def main() -> None:
     with path.open("wb") as fh, ThreadPoolExecutor(max_workers=a.workers) as outlets,             ThreadPoolExecutor(max_workers=a.workers * 2) as images:
         for g in range(0, len(skel), a.workers):
             group = skel[g:g + a.workers]
-            for data, k in outlets.map(lambda sk: build_line(sk, a.send_dim, images, template), group):
+            for data, k in outlets.map(lambda sk: build_line(sk, a.send_dim, images, template, cache), group):
                 fh.write(data)
                 n_img += k
             i = min(g + a.workers, len(skel))
@@ -325,7 +375,8 @@ def main() -> None:
     job = client.batches.create(model=a.model, src=up.name, config=types.CreateBatchJobConfig(display_name=display))
     print(f"batch created {job.name} display_name={display} state={job.state}")
     stub = {"job": job.name, "display_name": display, "src_file": up.name, "input_bytes": size, "count": len(skel),
-            "keys": [s["key"] for s in skel], "images": n_img, "built_s": round(t1 - t0), "model": a.model}
+            "keys": [s["key"] for s in skel], "images": n_img, "built_s": round(t1 - t0), "model": a.model,
+            "cache": cache}
     (out / f"{a.shard}.job.json").write_text(json.dumps(stub), encoding="utf-8")
     print(json.dumps({k: v for k, v in stub.items() if k != "keys"}))
 
