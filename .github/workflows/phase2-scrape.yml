@@ -19,7 +19,8 @@ on:
       menu_tab:    { required: false, type: string, default: "1" }   # 0 = skip the menu tab (the costliest part)
       screenshots: { required: false, type: string, default: "1" }   # 0 = no panel screenshots (backfill passes)
       photos:      { required: false, type: string, default: "1" }   # 0 = no CDN->blob photo mirroring
-      batch:       { required: false, type: string, default: "20" }  # placeIds per lease call
+      batch:       { required: false, type: string, default: "20" }
+      photo_dates_cap: { required: false, type: string, default: "" }  # 0 = walk every photo (slow)  # placeIds per lease call
       flush_s:     { required: false, type: string, default: "20" }  # seconds between result/attribute POSTs
   # MANUAL DISPATCH ONLY. The 30-minute self-drain cron was removed: with 21
   # fleet repos it meant every one of them picked up a run within half an hour of
@@ -128,6 +129,14 @@ jobs:
           # Best-effort; "0" disables. Cap keeps per-place time bounded.
           PHASE2_PHOTOS_TO_BLOB: "${{ inputs.photos || '1' }}"
           PHASE2_PHOTOS_MAX: "15"
+          # Cap the photo-DATE gallery walk. Default in code is 0 = walk EVERY
+          # gallery item at ~0.7s each, which measured 63% of total per-place
+          # time on parleagro_Bihar (avg 25 photos = 17.5s of a 27.8s budget)
+          # while only PHASE2_PHOTOS_MAX (15) are ever mirrored and ~2.6 URLs
+          # kept. The tail is brutal: 1.9% of places have >200 photos and one
+          # had 239,310, which can never finish inside a lease. 30 keeps dates
+          # for twice what is mirrored and cuts the walk to ~4.5s.
+          PHASE2_PHOTO_DATES_CAP: "${{ inputs.photo_dates_cap || vars.ACTIVE_PHOTO_DATES_CAP || '30' }}"
           # Fallback staging (also catches individual failed blob PUTs): save PNGs + a
           # manifest to this dir; the step below uploads it as a build artifact, drained
           # later by cloud/drain_screenshots.py. When every PUT lands in Blob the dir
