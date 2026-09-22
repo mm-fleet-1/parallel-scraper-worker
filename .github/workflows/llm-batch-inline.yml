@@ -19,7 +19,7 @@ on:
       dataset:       { required: true,  type: string, description: "dataset id, e.g. prod_p1" }
       shards:        { required: true,  type: string, description: "comma-separated shard names" }
       skeleton_base: { required: true,  type: string, description: "blob URL prefix holding <shard>.jsonl (no SAS)" }
-      model:         { required: true,  type: string, default: "gemini-3.7-flash" }
+      model:         { required: true,  type: string, default: "gemini-3.5-flash-lite" }
       per_job:       { required: false, type: string, default: "1",  description: "outlets per batch job (20 MB cap ~= 4)" }
       limit:         { required: false, type: string, default: "0",  description: "0 = whole shard; use a small number to test" }
       wait_minutes:  { required: false, type: string, default: "150", description: "measured per-job tail is 68 min; 40 strands results" }
