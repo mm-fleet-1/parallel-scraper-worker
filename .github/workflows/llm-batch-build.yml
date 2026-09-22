@@ -9,7 +9,7 @@ on:
       dataset:       { required: true,  type: string, description: "dataset id, e.g. riyadh" }
       shards:        { required: true,  type: string, description: "comma-separated shard names, e.g. shard_001,shard_002" }
       skeleton_base: { required: true,  type: string, description: "blob URL prefix holding <shard>.jsonl (no SAS)" }
-      model:         { required: true,  type: string, default: "gemini-3.7-flash" }
+      model:         { required: true,  type: string, default: "gemini-3.5-flash-lite" }
       send_dim:      { required: false, type: string, default: "1536" }
       max_parallel:  { required: false, type: string, default: "13" }
       collect:       { required: false, type: boolean, default: true,  description: "chain a collect job that polls until every shard is collected to blob" }
