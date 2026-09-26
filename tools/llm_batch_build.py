@@ -66,7 +66,59 @@ UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
 FETCH_HEADERS = {"User-Agent": UA, "Referer": "https://www.google.com/maps/"}
 
 
+COLLAGE = "collage:"
+
+
+def _collage(spec: str, dim: int) -> bytes:
+    """A 2x2 grid of up to 4 images, composed here so nothing has to be stored.
+
+    Image entry "collage:<urlsafe-base64 JSON {"tiles": [url, ...], "labels": [str, ...]}>". Used for Street View:
+    8 cuts of one panorama sent as 2 collages instead of 8 images (pilot 2026-09-26: boards read as well as the
+    full ring, at about a fifth of the added tokens). Each tile is 768 px, labelled bottom-left (the image
+    number stamp goes top-left). A tile that fails becomes a grey "unavailable" square; all four failing
+    raises, so the caller drops the image like any dead CDN link.
+    """
+    from PIL import ImageDraw, ImageFont
+    d = json.loads(base64.urlsafe_b64decode(spec.encode("ascii")).decode("utf-8"))
+    tiles, labels = d.get("tiles") or [], d.get("labels") or []
+    font = ImageFont.load_default(size=30)
+    canvas, ok = Image.new("RGB", (1536, 1536), (60, 60, 60)), 0
+    for i, url in enumerate(tiles[:4]):
+        im = None
+        for attempt in range(3):
+            try:
+                r = requests.get(signed(url), timeout=60, headers=FETCH_HEADERS)
+                if r.status_code == 200:
+                    im = Image.open(BytesIO(r.content)).convert("RGB").resize((768, 768))
+                    break
+                if 400 <= r.status_code < 500:
+                    break
+            except Exception:  # noqa: BLE001
+                pass
+            time.sleep(2 * (attempt + 1))
+        label = labels[i] if i < len(labels) else ""
+        if im is None:
+            im = Image.new("RGB", (768, 768), (90, 90, 90))
+            label = (label + " -- unavailable").strip(" -")
+        else:
+            ok += 1
+        if label:
+            dr = ImageDraw.Draw(im)
+            w = dr.textlength(label, font=font)
+            dr.rectangle([0, 768 - 46, w + 20, 768], fill="black")
+            dr.text((10, 768 - 42), label, fill="yellow", font=font)
+        canvas.paste(im, ((i % 2) * 768, (i // 2) * 768))
+    if not ok:
+        raise RuntimeError("collage: every tile failed")
+    canvas.thumbnail((dim, dim))
+    buf = BytesIO()
+    canvas.save(buf, "JPEG", quality=90)
+    return buf.getvalue()
+
+
 def fetch_resized(url: str, dim: int) -> bytes:
+    if url.startswith(COLLAGE):
+        return _collage(url[len(COLLAGE):], dim)
     last = None
     for attempt in range(4):
         try:
