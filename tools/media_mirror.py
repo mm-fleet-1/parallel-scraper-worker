@@ -8,6 +8,8 @@ Client-agnostic: whoever writes the manifest decides the keys, the URLs and the 
 
 Manifest shard line (JSONL, one per outlet, on blob):
   {"key": "<id>", "images": [{"url": "<any http url>", "name": "01_photo.jpg"}, ...]}
+Optional per image (13 Oct, Kwality Street View zooms): "crop": [x0, y0, x1, y1] as fractions of the fetched image and
+"scale" (default 1): the stored image is that part, enlarged by scale (JPEG q85). --dim is ignored for a cropped image.
 
 Result line, written back to <dest-base>/_mirrored/<shard>.jsonl:
   {"key": "<id>", "images": [{"src": "...", "url": "<durable blob url, no SAS>", "ok": true}, ...]}
@@ -85,6 +87,19 @@ def _resize(raw: bytes, dim: int) -> bytes:
     return buf.getvalue()
 
 
+def _crop(raw: bytes, box: list, scale: float) -> bytes:
+    from PIL import Image, ImageFile
+    ImageFile.LOAD_TRUNCATED_IMAGES = True
+    im = Image.open(BytesIO(raw)).convert("RGB")
+    w, h = im.size
+    part = im.crop((round(box[0] * w), round(box[1] * h), round(box[2] * w), round(box[3] * h)))
+    if scale and scale != 1:
+        part = part.resize((round(part.width * scale), round(part.height * scale)), Image.LANCZOS)
+    buf = BytesIO()
+    part.save(buf, "JPEG", quality=85)
+    return buf.getvalue()
+
+
 def exists(url: str, rq: str) -> bool:
     try:
         return requests.head(f"{url}?{rq}", timeout=30).status_code == 200
@@ -106,7 +121,10 @@ def mirror_one(img: dict, key: str, dest_base: str, rq: str, wq: str, dim: int) 
     if exists(dest, rq):
         return {**out, "ok": True, "skipped": True}
     try:
-        data = fetch(img["url"], rq, dim)
+        if img.get("crop"):
+            data = _crop(fetch(img["url"], rq, 0), img["crop"], float(img.get("scale") or 1))
+        else:
+            data = fetch(img["url"], rq, dim)
         put(dest, data, wq, CT.get(name.rsplit(".", 1)[-1].lower(), "application/octet-stream"))
         return {**out, "ok": True, "bytes": len(data)}
     except Exception as exc:  # noqa: BLE001
