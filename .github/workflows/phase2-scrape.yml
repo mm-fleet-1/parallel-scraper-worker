@@ -158,7 +158,10 @@ jobs:
       # The cache holds browser files only; a fresh runner still needs the system libs.
       - name: Install Playwright system deps (cache hit)
         if: steps.pw.outputs.cache-hit == 'true'
-        run: python -m playwright install-deps chromium
+        # install, not install-deps: an unpinned playwright upgrade keeps the old browser cache key
+        # (2026-10-16: 1.64 wanted chromium 1248, cache held an older build -> every worker failed setup).
+        # A no-op when the cached build already matches.
+        run: python -m playwright install --with-deps chromium
       - name: Playwright marker
         run: echo "STARTUP t_playwright=$(date +%s)"
       - name: Scrape (API mode)
