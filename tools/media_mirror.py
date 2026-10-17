@@ -10,6 +10,10 @@ Manifest shard line (JSONL, one per outlet, on blob):
   {"key": "<id>", "images": [{"url": "<any http url>", "name": "01_photo.jpg"}, ...]}
 Optional per image (13 Oct, Kwality Street View zooms): "crop": [x0, y0, x1, y1] as fractions of the fetched image and
 "scale" (default 1): the stored image is that part, enlarged by scale (JPEG q85). --dim is ignored for a cropped image.
+Optional per image (16 Oct, cooling re-check): "enhance": "dark" brightens the whole fetched image (autocontrast +
+gamma toward mid-grey, mild sharpen) BEFORE any crop / --dim; with neither it is re-encoded JPEG q90. Any other
+value, or no field, = unchanged behaviour. "enhance": "auto" measures the fetched image's mean luminance and brightens
+only when it is below AUTO_DARK (0.36); the result line then carries "lum" and "brightened" for that image.
 
 Result line, written back to <dest-base>/_mirrored/<shard>.jsonl:
   {"key": "<id>", "images": [{"src": "...", "url": "<durable blob url, no SAS>", "ok": true}, ...]}
@@ -29,7 +33,9 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import os
+import re
 import sys
 import time
 from concurrent.futures import ThreadPoolExecutor
@@ -42,6 +48,15 @@ BLOB_HOST = ".blob.core.windows.net"
 UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
       "(KHTML, like Gecko) Chrome/140.0 Safari/537.36")
 FETCH_HEADERS = {"User-Agent": UA, "Referer": "https://www.google.com/maps/"}
+AUTO_DARK = 0.36
+SAS_RE = re.compile(r"sig=[^&\s'\"]+")
+
+
+def _mask(s: str) -> str:
+    """never let a SAS signature reach a log or a result file"""
+    return SAS_RE.sub("sig=<redacted>", s)
+
+
 CT = {"jpg": "image/jpeg", "jpeg": "image/jpeg", "png": "image/png", "webp": "image/webp"}
 
 
@@ -72,25 +87,52 @@ def fetch(url: str, rq: str, dim: int) -> bytes:
             if 400 <= r.status_code < 500:
                 break          # an expired CDN link will not become a 200 on retry
         except Exception as exc:  # noqa: BLE001
-            last = str(exc)[:120]
+            last = _mask(str(exc))[:120]
         time.sleep(2 * (attempt + 1))
     raise RuntimeError(last or "unknown")
 
 
-def _resize(raw: bytes, dim: int) -> bytes:
+def _brighten(im):
+    """Lift a dark RGB photo for a second vision pass. Already-bright photos (mean L > 0.45) only get a mild
+    autocontrast (25% blend). preserve_tone stretches all channels by the same luminance histogram, so colours do not shift."""
+    from PIL import Image, ImageFilter, ImageOps, ImageStat
+    if ImageStat.Stat(im.convert("L")).mean[0] / 255 > 0.45:
+        return Image.blend(im, ImageOps.autocontrast(im, cutoff=0.5, preserve_tone=True), 0.25)
+    im = ImageOps.autocontrast(im, cutoff=1, preserve_tone=True)
+    mean = min(max(ImageStat.Stat(im.convert("L")).mean[0] / 255, 0.01), 0.99)
+    gamma = min(1.0, max(0.45, math.log(0.47) / math.log(mean)))   # mean ** gamma ~= 0.47, clamped
+    im = im.point([round(255 * (i / 255) ** gamma) for i in range(256)] * 3)
+    return im.filter(ImageFilter.UnsharpMask(radius=2, percent=60, threshold=3))
+
+
+def _lum(im) -> float:
+    from PIL import ImageStat
+    return ImageStat.Stat(im.convert("L")).mean[0] / 255
+
+
+def _resize(raw: bytes, dim: int, enhance: bool = False, info: dict | None = None) -> bytes:
     from PIL import Image, ImageFile
     ImageFile.LOAD_TRUNCATED_IMAGES = True
     im = Image.open(BytesIO(raw)).convert("RGB")
-    im.thumbnail((dim, dim))
+    if info is not None:                      # "auto": decide from the photo itself
+        info["lum"] = round(_lum(im), 3); enhance = info["brightened"] = info["lum"] < AUTO_DARK
+    if enhance:
+        im = _brighten(im)
+    if dim:
+        im.thumbnail((dim, dim))
     buf = BytesIO()
     im.save(buf, "JPEG", quality=90)
     return buf.getvalue()
 
 
-def _crop(raw: bytes, box: list, scale: float) -> bytes:
+def _crop(raw: bytes, box: list, scale: float, enhance: bool = False, info: dict | None = None) -> bytes:
     from PIL import Image, ImageFile
     ImageFile.LOAD_TRUNCATED_IMAGES = True
     im = Image.open(BytesIO(raw)).convert("RGB")
+    if info is not None:                      # "auto": measured on the WHOLE photo, so its crops follow the same decision
+        info["lum"] = round(_lum(im), 3); enhance = info["brightened"] = info["lum"] < AUTO_DARK
+    if enhance:
+        im = _brighten(im)
     w, h = im.size
     part = im.crop((round(box[0] * w), round(box[1] * h), round(box[2] * w), round(box[3] * h)))
     if scale and scale != 1:
@@ -111,7 +153,7 @@ def put(url: str, data: bytes, wq: str, ct: str) -> None:
     r = requests.put(f"{url}?{wq}", data=data,
                      headers={"x-ms-blob-type": "BlockBlob", "Content-Type": ct}, timeout=300)
     if r.status_code not in (200, 201):
-        raise RuntimeError(f"PUT HTTP {r.status_code} {r.text[:120]}")
+        raise RuntimeError(_mask(f"PUT HTTP {r.status_code} {r.text[:120]}"))
 
 
 def mirror_one(img: dict, key: str, dest_base: str, rq: str, wq: str, dim: int) -> dict:
@@ -121,16 +163,20 @@ def mirror_one(img: dict, key: str, dest_base: str, rq: str, wq: str, dim: int) 
     if exists(dest, rq):
         return {**out, "ok": True, "skipped": True}
     try:
+        enhance = img.get("enhance") == "dark"
+        info = {} if img.get("enhance") == "auto" else None
         if img.get("crop"):
-            data = _crop(fetch(img["url"], rq, 0), img["crop"], float(img.get("scale") or 1))
+            data = _crop(fetch(img["url"], rq, 0), img["crop"], float(img.get("scale") or 1), enhance, info)
+        elif enhance or info is not None:
+            data = _resize(fetch(img["url"], rq, 0), dim, enhance, info)
         else:
             data = fetch(img["url"], rq, dim)
         put(dest, data, wq, CT.get(name.rsplit(".", 1)[-1].lower(), "application/octet-stream"))
-        return {**out, "ok": True, "bytes": len(data)}
+        return {**out, "ok": True, "bytes": len(data), **(info or {})}
     except Exception as exc:  # noqa: BLE001
         # One dead photo must never fail the shard: expired CDN links are expected and the
         # caller drops them from the deliverable on the strength of ok=false.
-        return {**out, "ok": False, "error": str(exc)[:160]}
+        return {**out, "ok": False, "error": _mask(str(exc))[:160]}
 
 
 def main() -> None:
@@ -165,7 +211,7 @@ def main() -> None:
     print(f"{a.shard}: mirrored {ok - skipped:,} | already there {skipped:,} | failed {len(done) - ok:,}")
     for _, x in done:
         if not x["ok"]:
-            print(f"  FAIL {x['src'][:90]} -> {x['error']}")
+            print(f"  FAIL {_mask(x['src'])[:90]} -> {_mask(x['error'])}")
     # A shard where EVERY image failed is a config error (bad SAS, wrong dest), not dead
     # CDN links - fail loudly rather than writing an all-false result file and moving on.
     if done and ok == 0:
