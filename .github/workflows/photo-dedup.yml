@@ -1,0 +1,49 @@
+name: photo-dedup
+
+# Content-based duplicate check (dHash + 64x64 pixel compare) between stored and current outlet
+# photos in scraper-media (tools/photo_dedup.py). Reads manifest shards from blob, writes one
+# result file per shard. No model calls. Manual dispatch only.
+on:
+  workflow_dispatch:
+    inputs:
+      shards:        { required: true,  type: string, description: "comma-separated shard names" }
+      manifest_base: { required: true,  type: string, description: "blob URL prefix holding <shard>.jsonl (no SAS)" }
+      out_base:      { required: true,  type: string, description: "blob URL prefix for <shard>.jsonl results (no SAS)" }
+      workers:       { required: false, type: string, default: "48" }
+      max_parallel:  { required: false, type: string, default: "20" }
+
+jobs:
+  plan:
+    runs-on: ubuntu-22.04
+    outputs:
+      matrix: ${{ steps.mk.outputs.matrix }}
+    steps:
+      - id: mk
+        env:
+          SHARDS: ${{ inputs.shards }}
+        run: |
+          python3 -c 'import json,os; print("matrix=" + json.dumps([s.strip() for s in os.environ["SHARDS"].split(",") if s.strip()]))' >> "$GITHUB_OUTPUT"
+
+  dedup:
+    needs: plan
+    runs-on: ubuntu-22.04
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      max-parallel: ${{ fromJson(inputs.max_parallel) }}
+      matrix:
+        shard: ${{ fromJson(needs.plan.outputs.matrix) }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - run: pip install --quiet requests pillow numpy
+      - name: Dedup this shard
+        env:
+          MEDIA_BLOB_READ_SAS: ${{ secrets.MEDIA_BLOB_READ_SAS }}
+          MEDIA_BLOB_WRITE_SAS: ${{ secrets.MEDIA_BLOB_WRITE_SAS }}
+        run: |
+          python tools/photo_dedup.py \
+            --manifest-url "${{ inputs.manifest_base }}/${{ matrix.shard }}.jsonl" \
+            --out-base "${{ inputs.out_base }}" --shard "${{ matrix.shard }}" --workers "${{ inputs.workers }}"
