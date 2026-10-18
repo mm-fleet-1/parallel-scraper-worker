@@ -10,12 +10,24 @@ Idempotent: "collected" == results blob exists (HEAD with the read SAS). Safe to
 
 env: LLM_BATCH_GEMINI_KEY, MEDIA_BLOB_READ_SAS, MEDIA_BLOB_WRITE_SAS (falls back to PHASE2_SHOT_BLOB_SAS)
 usage: python tools/llm_batch_collect.py [--client flora] [--dataset riyadh_p1] [--keep-inputs]
+       [--shards shard_0001,shard_0002 --wait-minutes 200]
+--shards (18 Oct 2026): only those shards; with --wait-minutes, keep polling until EACH listed shard is collected or
+terminally failed -- including shards whose batch does not exist yet (still building on another run), so a collect can
+be dispatched next to its builds instead of after them. No dataset clean-up (jobs / cache) in this mode: other shards of
+the dataset may still be building against the cache. Run one plain --client --dataset sweep at the very end for that.
+--chained (v2 round 2, CONTRACT_SUBMIT.md): the collect job chained after a build run's matrix. A listed shard with no batch
+is waited for only while llm-batch/<client>/<dataset>/submit/<shard>.intent.json may exist (any answer but a clean 404);
+a shard whose build failed before submitting (no intent) is not waited for. Exits once nothing is left to wait for.
+Stranded results: anything still running at --wait-minutes stays uncollected here; the driver dispatches a dataset-wide
+sweep (llm-batch-collect.yml with client + dataset, no shards) at the end, which picks those up.
+--key-index N: use LLM_BATCH_GEMINI_KEY_<N> (the project the build ran in), as llm_batch_build.py does.
 """
 from __future__ import annotations
 
 import argparse
 import json
 import os
+import re
 import sys
 import time
 from datetime import datetime, timezone
@@ -34,14 +46,54 @@ def _q(var: str, *fallbacks: str) -> str:
     raise SystemExit(f"{var} missing")
 
 
+SAS_RE = re.compile(r"sig=[^&\s'\"]+")
+
+
+_SECRETS: list[str] = []   # the API key once known
+
+
+def _mask(s: str) -> str:
+    s = SAS_RE.sub("sig=<redacted>", s)
+    for k in _SECRETS:
+        s = s.replace(k, "<key>")
+    return s
+
+
+def _http(method: str, url: str, tries: int = 4, **kw) -> requests.Response:
+    """All blob calls: transport errors / 429 / 5xx retried; a transport failure raises with the SAS masked, unchained."""
+    for attempt in range(tries):
+        try:
+            r = requests.request(method, url, **kw)
+            if r.status_code not in (429, 500, 502, 503, 504) or attempt == tries - 1:
+                return r
+        except requests.RequestException as exc:
+            if attempt == tries - 1:
+                raise RuntimeError(f"{method} {url.split('?', 1)[0].rsplit('/', 1)[-1]}: {_mask(str(exc))[:160]}") from None
+        time.sleep(2 * (attempt + 1))
+    raise AssertionError("unreachable")
+
+
+def blob_status(url: str, rq: str) -> int | None:
+    """HTTP status of a HEAD, None when the request itself failed."""
+    try:
+        return _http("HEAD", f"{url}?{rq}", timeout=30).status_code
+    except RuntimeError:
+        return None
+
+
 def blob_exists(url: str, rq: str) -> bool:
-    return requests.head(f"{url}?{rq}", timeout=30).status_code == 200
+    return blob_status(url, rq) == 200
 
 
-def blob_put(url: str, data: bytes, wq: str, ct: str = "application/json") -> None:
-    r = requests.put(f"{url}?{wq}", data=data, headers={"x-ms-blob-type": "BlockBlob", "Content-Type": ct}, timeout=600)
+def blob_put(url: str, data: bytes, wq: str, ct: str = "application/json", if_absent: bool = False) -> bool:
+    """False only when if_absent and the blob already exists (final review: two collectors never overwrite results)."""
+    hdr = {"x-ms-blob-type": "BlockBlob", "Content-Type": ct, **({"If-None-Match": "*"} if if_absent else {})}
+    r = _http("PUT", f"{url}?{wq}", data=data, headers=hdr, timeout=600)
+    if if_absent and r.status_code in (409, 412):
+        return False
     if r.status_code not in (200, 201):
-        raise RuntimeError(f"PUT {url.rsplit('/', 1)[-1]}: HTTP {r.status_code} {r.text[:160]}")
+        raise RuntimeError(_mask(f"PUT {url.rsplit('/', 1)[-1]}: HTTP {r.status_code} {r.text[:160]}"))
+    return True
 
 
 def main() -> None:
@@ -52,8 +104,18 @@ def main() -> None:
                     help="poll until every matching job is terminal (0 = single sweep, the cron behaviour). "
                          "Used when chained onto llm-batch-build, where jobs are still RUNNING at first sweep.")
     ap.add_argument("--keep-inputs", action="store_true", help="do not delete Files-API inputs after collect")
+    ap.add_argument("--shards", default="", help="comma-separated shard names (needs --client and --dataset)")
+    ap.add_argument("--chained", action="store_true",
+                    help="after a build run: do not wait for listed shards that never wrote an intent marker")
+    ap.add_argument("--key-index", default="", help="1..N -> LLM_BATCH_GEMINI_KEY_<n> (same slot as the build)")
     a = ap.parse_args()
-    key = os.environ.get("LLM_BATCH_GEMINI_KEY") or sys.exit("LLM_BATCH_GEMINI_KEY missing")
+    a.shards = {x.strip() for x in a.shards.split(",") if x.strip()}
+    if a.shards and not (a.client and a.dataset):
+        sys.exit("--shards needs --client and --dataset")
+    key = ((os.environ.get(f"LLM_BATCH_GEMINI_KEY_{a.key_index}") if a.key_index else None)
+           or os.environ.get("LLM_BATCH_GEMINI_KEY") or sys.exit(f"LLM_BATCH_GEMINI_KEY_{a.key_index or ''} missing"))
+    _SECRETS.append(key)
+    print(f"  using key slot {a.key_index or chr(39) * 2}")
     rq, wq = _q("MEDIA_BLOB_READ_SAS"), _q("MEDIA_BLOB_WRITE_SAS", "PHASE2_SHOT_BLOB_SAS")
     from google import genai
     client = genai.Client(api_key=key)
@@ -61,14 +123,17 @@ def main() -> None:
     deadline = time.time() + a.wait_minutes * 60
     while True:
         r = sweep(a, client, rq, wq)
-        if not a.wait_minutes or r["unfinished"] == 0:
+        if not a.wait_minutes or (r["unfinished"] == 0 and not r["not_submitted"]):
             break
         if time.time() >= deadline:
-            print(f"WARNING {r['unfinished']} job(s) still running at --wait-minutes={a.wait_minutes}. "
-                  f"Their results are NOT collected; re-dispatch this workflow to finish.")
+            print(f"WARNING {r['unfinished']} job(s) still running, {len(r['not_submitted'])} shard(s) not visible as a batch "
+                  f"{sorted(r['not_submitted'])[:20]} at --wait-minutes={a.wait_minutes}. "
+                  f"Their results are NOT collected here; the driver's final dataset sweep (llm-batch-collect.yml, "
+                  f"client + dataset, no shards) collects them.")
             break
-        print(f"  {r['unfinished']} job(s) still running; re-checking in 60s", flush=True)
-        time.sleep(60)
+        pause = 30 if a.shards else 60
+        print(f"  {r['unfinished']} job(s) still running, {len(r['not_submitted'])} not submitted yet; re-checking in {pause}s", flush=True)
+        time.sleep(pause)
 
 
 def sweep(a, client, rq, wq) -> dict:
@@ -81,7 +146,7 @@ def sweep(a, client, rq, wq) -> dict:
             if getattr(f, "display_name", None):
                 files_by_display[f.display_name] = f.name
     except Exception as exc:  # noqa: BLE001
-        print(f"files.list failed: {str(exc)[:120]}")
+        print(f"files.list failed: {_mask(str(exc))[:120]}")
     seen = collected = failed = unfinished = 0
     fully_done: list[str] = []
     datasets: set = set()
@@ -93,18 +158,21 @@ def sweep(a, client, rq, wq) -> dict:
         if len(parts) != 3:
             continue
         cl, ds, shard = parts
-        if (a.client and cl != a.client) or (a.dataset and ds != a.dataset):
+        if (a.client and cl != a.client) or (a.dataset and ds != a.dataset) or (a.shards and shard not in a.shards):
             continue
         by_name.setdefault(dn, []).append(job)
     for dn, jobs in by_name.items():
         jobs.sort(key=lambda j: str(getattr(j, "create_time", "")))
         job = jobs[-1]
+        if len(jobs) > 1:   # final review: should never happen (builder refuses ALREADY_SUBMITTED) - make it loud
+            print(f"!! DUPLICATE BATCHES for {dn}: {[j.name for j in jobs]} - collecting the newest only; the older ones "
+                  f"are billed and need a manual collect / cancel")
         cl, ds, shard = dn.split("/")
         seen += 1
         try:  # list() omits src/dest/batch_stats; the full object has them
             job = client.batches.get(name=job.name)
         except Exception as exc:  # noqa: BLE001
-            print(f"  batches.get({job.name}) failed: {str(exc)[:120]}")
+            print(f"  batches.get({job.name}) failed: {_mask(str(exc))[:120]}")
         base = f"{CONTAINER}/llm-batch/{cl}/{ds}"
         results_url = f"{base}/results/{shard}.jsonl"
         status_url = f"{base}/status/{shard}.json"
@@ -141,14 +209,19 @@ def sweep(a, client, rq, wq) -> dict:
                     # were produced this way before it was caught, 2026-08-21.)
                     print(f"  skip {dn}: inline job, published by llm_batch_inline.py")
                     continue
-                blob_put(results_url, text.encode("utf-8"), wq, "application/x-ndjson")
-                collected += 1
-                print(f"collected {dn} -> {results_url} ({len(text) / 1e6:.1f} MB)")
+                if not text.strip():   # final review: never publish an empty results file
+                    print(f"  !! {dn}: batch output is empty - not published, left for a later collect")
+                    continue
+                if blob_put(results_url, text.encode("utf-8"), wq, "application/x-ndjson", if_absent=True):
+                    collected += 1
+                    print(f"collected {dn} -> {results_url} ({len(text) / 1e6:.1f} MB)")
+                else:
+                    print(f"  {dn}: results already published by another collector - kept as is")
             stub["results_url"] = results_url
             stub["collected_at"] = now
         elif state in TERMINAL_BAD:
             err = getattr(job, "error", None)
-            stub["error"] = str(err)[:500] if err else state
+            stub["error"] = _mask(str(err))[:500] if err else state
             failed += 1
         # Only a SUCCEEDED job is finished with its input. A FAILED job is a retry
         # candidate: Google fails batches for its own reasons (we saw
@@ -167,11 +240,11 @@ def sweep(a, client, rq, wq) -> dict:
                 client.files.delete(name=src)
                 stub["input_deleted"] = True
             except Exception as exc:  # noqa: BLE001
-                gone = "404" in str(exc) or "not found" in str(exc).lower()
+                gone = "404" in _mask(str(exc)) or "not found" in _mask(str(exc)).lower()
                 stub["input_deleted"] = gone
                 if not gone:
-                    stub["input_delete_error"] = str(exc)[:300]
-                    print(f"  files.delete({src}) failed: {str(exc)[:200]}")
+                    stub["input_delete_error"] = _mask(str(exc))[:300]
+                    print(f"  files.delete({src}) failed: {_mask(str(exc))[:200]}")
         if state != "JOB_STATE_SUCCEEDED" and state not in TERMINAL_BAD:
             unfinished += 1
         blob_put(status_url, json.dumps(stub).encode("utf-8"), wq)
@@ -183,26 +256,35 @@ def sweep(a, client, rq, wq) -> dict:
     # finished batch jobs (their results + status stubs are on blob) and the cached-prompt-mode cache, which
     # bills storage per hour. Failed jobs are kept (retry candidates), so nothing is deleted while any exist.
     cleaned = {"jobs_deleted": 0, "caches_deleted": 0}
-    if a.client and a.dataset and unfinished == 0 and failed == 0 and seen and len(fully_done) == seen             and not a.keep_inputs:
+    if a.client and a.dataset and unfinished == 0 and failed == 0 and seen and len(fully_done) == seen \
+            and not a.keep_inputs and not a.shards:
         for name in fully_done:
             try:
                 client.batches.delete(name=name)
                 cleaned["jobs_deleted"] += 1
             except Exception as exc:  # noqa: BLE001
-                print(f"  batches.delete({name}) failed: {str(exc)[:120]}")
+                print(f"  batches.delete({name}) failed: {_mask(str(exc))[:120]}")
         try:
             for c in client.caches.list():
                 if c.display_name == f"{a.client}/{a.dataset}/system":
                     client.caches.delete(name=c.name)
                     cleaned["caches_deleted"] += 1
         except Exception as exc:  # noqa: BLE001
-            print(f"  cache cleanup failed: {str(exc)[:120]}")
+            print(f"  cache cleanup failed: {_mask(str(exc))[:120]}")
+    not_submitted = a.shards - {dn.split("/")[2] for dn in by_name}
+    if a.chained:   # wait only for shards that may still have a batch: results absent AND intent not a clean 404
+        base = f"{CONTAINER}/llm-batch/{a.client}/{a.dataset}"
+        not_submitted = {s for s in not_submitted if not blob_exists(f"{base}/results/{s}.jsonl", rq)
+                         and blob_status(f"{base}/submit/{s}.intent.json", rq) != 404}
     out = {"jobs_seen": seen, "newly_collected": collected, "failed": failed,
-           "unfinished": unfinished, "checked_at": now, **cleaned}
+           "unfinished": unfinished, "not_submitted": sorted(not_submitted), "checked_at": now, **cleaned}
     print(json.dumps(out))
     return out
 
 
 if __name__ == "__main__":
     sys.stdout.reconfigure(line_buffering=True)
-    main()
+    try:
+        main()
+    except Exception as exc:  # noqa: BLE001  (no traceback: it could carry a signed URL)
+        sys.exit(_mask(f"{type(exc).__name__}: {exc}")[:400])
