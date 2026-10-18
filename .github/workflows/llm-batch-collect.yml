@@ -1,4 +1,5 @@
 name: llm-batch-collect
+run-name: collect ${{ inputs.dataset }} ${{ inputs.shards }}
 
 # Generic: every 15 min, collect finished Gemini batch jobs of this project to blob and free their
 # Files-API inputs. Dormant unless repo variable LLM_BATCH_ACTIVE == "1" (or manual dispatch).
@@ -15,9 +16,12 @@ on:
       client:  { required: false, type: string, default: "" }
       dataset: { required: false, type: string, default: "" }
       wait_minutes: { required: false, type: string, default: "0", description: "poll until every matching job is terminal (0 = one sweep)" }
+      shards:  { required: false, type: string, default: "", description: "comma-separated shards: wait for EACH (even if not yet submitted); no dataset clean-up. Needs client + dataset" }
+      key_index: { required: false, type: string, default: "", description: "1..21 -> secret LLM_BATCH_GEMINI_KEY_<n> (the build's project); blank = LLM_BATCH_GEMINI_KEY" }
 
+# Per-shard-list collects run side by side (own group = run id); plain sweeps stay serialized as before.
 concurrency:
-  group: llm-batch-collect
+  group: ${{ inputs.shards != '' && format('llm-batch-collect-run-{0}', github.run_id) || 'llm-batch-collect' }}
   cancel-in-progress: false
 
 jobs:
@@ -34,12 +38,40 @@ jobs:
       - name: Collect finished batches -> blob
         env:
           LLM_BATCH_GEMINI_KEY: ${{ secrets.LLM_BATCH_GEMINI_KEY }}
+          LLM_BATCH_GEMINI_KEY_1: ${{ secrets.LLM_BATCH_GEMINI_KEY_1 }}
+          LLM_BATCH_GEMINI_KEY_2: ${{ secrets.LLM_BATCH_GEMINI_KEY_2 }}
+          LLM_BATCH_GEMINI_KEY_3: ${{ secrets.LLM_BATCH_GEMINI_KEY_3 }}
+          LLM_BATCH_GEMINI_KEY_4: ${{ secrets.LLM_BATCH_GEMINI_KEY_4 }}
+          LLM_BATCH_GEMINI_KEY_5: ${{ secrets.LLM_BATCH_GEMINI_KEY_5 }}
+          LLM_BATCH_GEMINI_KEY_6: ${{ secrets.LLM_BATCH_GEMINI_KEY_6 }}
+          LLM_BATCH_GEMINI_KEY_7: ${{ secrets.LLM_BATCH_GEMINI_KEY_7 }}
+          LLM_BATCH_GEMINI_KEY_8: ${{ secrets.LLM_BATCH_GEMINI_KEY_8 }}
+          LLM_BATCH_GEMINI_KEY_9: ${{ secrets.LLM_BATCH_GEMINI_KEY_9 }}
+          LLM_BATCH_GEMINI_KEY_10: ${{ secrets.LLM_BATCH_GEMINI_KEY_10 }}
+          LLM_BATCH_GEMINI_KEY_11: ${{ secrets.LLM_BATCH_GEMINI_KEY_11 }}
+          LLM_BATCH_GEMINI_KEY_12: ${{ secrets.LLM_BATCH_GEMINI_KEY_12 }}
+          LLM_BATCH_GEMINI_KEY_13: ${{ secrets.LLM_BATCH_GEMINI_KEY_13 }}
+          LLM_BATCH_GEMINI_KEY_14: ${{ secrets.LLM_BATCH_GEMINI_KEY_14 }}
+          LLM_BATCH_GEMINI_KEY_15: ${{ secrets.LLM_BATCH_GEMINI_KEY_15 }}
+          LLM_BATCH_GEMINI_KEY_16: ${{ secrets.LLM_BATCH_GEMINI_KEY_16 }}
+          LLM_BATCH_GEMINI_KEY_17: ${{ secrets.LLM_BATCH_GEMINI_KEY_17 }}
+          LLM_BATCH_GEMINI_KEY_18: ${{ secrets.LLM_BATCH_GEMINI_KEY_18 }}
+          LLM_BATCH_GEMINI_KEY_19: ${{ secrets.LLM_BATCH_GEMINI_KEY_19 }}
+          LLM_BATCH_GEMINI_KEY_20: ${{ secrets.LLM_BATCH_GEMINI_KEY_20 }}
+          LLM_BATCH_GEMINI_KEY_21: ${{ secrets.LLM_BATCH_GEMINI_KEY_21 }}
           MEDIA_BLOB_READ_SAS: ${{ secrets.MEDIA_BLOB_READ_SAS }}
           MEDIA_BLOB_WRITE_SAS: ${{ secrets.MEDIA_BLOB_WRITE_SAS }}
           PHASE2_SHOT_BLOB_SAS: ${{ secrets.PHASE2_SHOT_BLOB_SAS }}
+          CLIENT: ${{ inputs.client }}
+          DATASET: ${{ inputs.dataset }}
+          WAIT: ${{ inputs.wait_minutes }}
+          SHARDS: ${{ inputs.shards }}
+          KEY_INDEX: ${{ inputs.key_index }}
         run: |
-          ARGS=""
-          if [ -n "${{ inputs.client }}" ]; then ARGS="$ARGS --client ${{ inputs.client }}"; fi
-          if [ -n "${{ inputs.dataset }}" ]; then ARGS="$ARGS --dataset ${{ inputs.dataset }}"; fi
-          if [ "${{ inputs.wait_minutes }}" != "0" ]; then ARGS="$ARGS --wait-minutes ${{ inputs.wait_minutes }}"; fi
-          python tools/llm_batch_collect.py $ARGS
+          ARGS=()
+          if [ -n "$CLIENT" ]; then ARGS+=(--client "$CLIENT"); fi
+          if [ -n "$DATASET" ]; then ARGS+=(--dataset "$DATASET"); fi
+          if [ "$WAIT" != "0" ]; then ARGS+=(--wait-minutes "$WAIT"); fi
+          if [ -n "$SHARDS" ]; then ARGS+=(--shards "$SHARDS"); fi
+          if [ -n "$KEY_INDEX" ]; then ARGS+=(--key-index "$KEY_INDEX"); fi
+          python tools/llm_batch_collect.py "${ARGS[@]}"
