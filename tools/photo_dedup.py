@@ -21,6 +21,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import random
 import sys
 import threading
 import time
@@ -55,7 +56,7 @@ def _session() -> requests.Session:
 
 
 def get(url: str, rq: str) -> bytes | None:
-    for attempt in range(4):
+    for attempt in range(6):
         try:
             r = _session().get(f"{url}?{rq}", timeout=60)
             if r.status_code == 200:
@@ -64,7 +65,7 @@ def get(url: str, rq: str) -> bytes | None:
                 return None
         except Exception:  # noqa: BLE001 - never echo the exception: it carries the signed URL
             pass
-        time.sleep(2 * (attempt + 1))
+        time.sleep(min(30, 2 * 2 ** attempt) * (0.5 + random.random()))   # 18 Oct: backoff + jitter (503 under load)
     return None
 
 
@@ -152,10 +153,19 @@ def main() -> None:
                     "dims": {p: list(F[p][:2]) for p in row["sep"] + row["cur"] if F.get(p) is not None},
                     "fail": [p for p in row["sep"] + row["cur"] if F.get(p) is None], "pairs": pairs})
     body = ("\n".join(json.dumps(o) for o in out) + "\n").encode()
-    pr = requests.put(f"{out_url}?{wq}", data=body, timeout=300,
-                      headers={"x-ms-blob-type": "BlockBlob", "Content-Type": "application/x-ndjson"})
-    if pr.status_code not in (200, 201):
-        sys.exit(f"{a.shard}: result PUT HTTP {pr.status_code}")
+    code = "none"
+    for attempt in range(10):   # 18 Oct: Azure 503 (server busy) at 860 parallel jobs - retry with backoff + jitter
+        try:
+            pr = _session().put(f"{out_url}?{wq}", data=body, timeout=300,
+                                headers={"x-ms-blob-type": "BlockBlob", "Content-Type": "application/x-ndjson"})
+            code = pr.status_code
+            if code in (200, 201):
+                break
+        except Exception as e:  # noqa: BLE001 - never echo the exception: it carries the signed URL
+            code = type(e).__name__
+        time.sleep(min(60, 3 * 2 ** attempt) * (0.5 + random.random()))
+    else:
+        sys.exit(f"{a.shard}: result PUT failed after retries ({code})")
     print(f"{a.shard}: wrote {len(out)} outlets")
     if paths and all(v is None for v in F.values()):
         sys.exit(f"{a.shard}: every image failed - check MEDIA_BLOB_READ_SAS")
