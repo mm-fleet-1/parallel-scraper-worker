@@ -1,4 +1,6 @@
 name: llm-batch-build
+# 18 Oct 2026: run-name lets a driver find ITS run (gh run list --json displayTitle) instead of "latest".
+run-name: ${{ inputs.dataset }} ${{ inputs.shards }}
 
 # Generic: build Gemini Batch input chunks from client-written skeleton shards on blob,
 # upload to the Files API and create the batch jobs. Manual dispatch only.
@@ -16,8 +18,11 @@ on:
       collect:       { required: false, type: boolean, default: true,  description: "chain a collect job that polls until every shard is collected to blob" }
       collect_wait_minutes: { required: false, type: string, default: "180", description: "give up polling after this long; uncollected jobs need a manual llm-batch-collect" }
 
+# 18 Oct 2026: one group per RUN (was per dataset). The chained collect is now scoped to this run's own shards and never
+# deletes the dataset cache, so runs of one dataset no longer need serializing -- and a per-dataset group let GitHub keep
+# only ONE pending run, cancelling the older pending one (silently dropped shards when a driver dispatched several).
 concurrency:
-  group: llm-batch-${{ inputs.client }}-${{ inputs.dataset }}
+  group: llm-batch-run-${{ github.run_id }}
   cancel-in-progress: false
 
 jobs:
@@ -30,7 +35,7 @@ jobs:
         env:
           SHARDS: ${{ inputs.shards }}
         run: |
-          python3 -c 'import json,os; print("matrix=" + json.dumps([s.strip() for s in os.environ["SHARDS"].split(",") if s.strip()]))' >> "$GITHUB_OUTPUT"
+          python3 -c 'import json,os,sys; m=list(dict.fromkeys(s.strip() for s in os.environ["SHARDS"].split(",") if s.strip())); sys.exit("more than 256 shards in one run") if len(m)>256 else print("matrix=" + json.dumps(m))' >> "$GITHUB_OUTPUT"
 
   build:
     needs: plan
@@ -72,18 +77,23 @@ jobs:
           LLM_BATCH_GEMINI_KEY_20: ${{ secrets.LLM_BATCH_GEMINI_KEY_20 }}
           LLM_BATCH_GEMINI_KEY_21: ${{ secrets.LLM_BATCH_GEMINI_KEY_21 }}
           MEDIA_BLOB_READ_SAS: ${{ secrets.MEDIA_BLOB_READ_SAS }}
+          MEDIA_BLOB_WRITE_SAS: ${{ secrets.MEDIA_BLOB_WRITE_SAS }}   # submit markers (CONTRACT_SUBMIT.md)
+          PHASE2_SHOT_BLOB_SAS: ${{ secrets.PHASE2_SHOT_BLOB_SAS }}
         run: |
           python tools/llm_batch_build.py \
             --skeleton-url "${{ inputs.skeleton_base }}/${{ matrix.shard }}.jsonl" \
             --client "${{ inputs.client }}" --dataset "${{ inputs.dataset }}" --shard "${{ matrix.shard }}" \
             --model "${{ inputs.model }}" --send-dim "${{ inputs.send_dim }}" \
-            --key-index "${{ inputs.key_index }}"
-      - uses: actions/upload-artifact@v4
-        with:
-          name: job-${{ inputs.client }}-${{ inputs.dataset }}-${{ matrix.shard }}
-          path: batch_out/*.job.json
-          retention-days: 7
+            --key-index "${{ inputs.key_index }}" --max-minutes 105
 
+  # 18 Oct 2026 (v2 round 2): scoped to THIS run's shard list (input), not to artifacts -- an artifact was written only
+  # after batches.create returned, so a leg that died between create and the artifact left a real batch uncollected.
+  # --chained: a shard is waited for while it has a batch, or an intent marker that is not a clean 404
+  # (llm-batch/<client>/<dataset>/submit/<shard>.intent.json, written by the builder just before batches.create);
+  # a leg that failed before submitting (QUOTA_TIMEOUT, SHARD_TOO_BIG, ...: prefail marker, no intent) is not waited for.
+  # Other runs of the same dataset are untouched. No dataset clean-up here (batch jobs + prompt cache stay; the cache
+  # expires after 48h). Anything still running at collect_wait_minutes stays uncollected: the driver dispatches
+  # llm-batch-collect.yml with client + dataset and no shards at the end, which collects it and cleans up.
   # Collect exactly when a run is active. The llm-batch-collect cron was removed
   # 2026-08-21 (a cron records a run even when its `if` skips it, so a dormant collector
   # produced ~288 no-op runs/day). Chaining it here means nothing fires while idle, and a
@@ -101,7 +111,7 @@ jobs:
         with:
           python-version: "3.11"
       - run: pip install --quiet requests google-genai
-      - name: Poll + collect this dataset -> blob
+      - name: Poll + collect this run's shards -> blob
         env:
           LLM_BATCH_GEMINI_KEY: ${{ secrets.LLM_BATCH_GEMINI_KEY }}
           LLM_BATCH_GEMINI_KEY_1: ${{ secrets.LLM_BATCH_GEMINI_KEY_1 }}
@@ -128,5 +138,11 @@ jobs:
           MEDIA_BLOB_READ_SAS: ${{ secrets.MEDIA_BLOB_READ_SAS }}
           MEDIA_BLOB_WRITE_SAS: ${{ secrets.MEDIA_BLOB_WRITE_SAS }}
           PHASE2_SHOT_BLOB_SAS: ${{ secrets.PHASE2_SHOT_BLOB_SAS }}
+          CLIENT: ${{ inputs.client }}
+          DATASET: ${{ inputs.dataset }}
+          SHARDS: ${{ inputs.shards }}
+          KEY_INDEX: ${{ inputs.key_index }}
+          WAIT: ${{ inputs.collect_wait_minutes }}
         run: |
-          python tools/llm_batch_collect.py             --client "${{ inputs.client }}" --dataset "${{ inputs.dataset }}"             --wait-minutes "${{ inputs.collect_wait_minutes }}"
+          python tools/llm_batch_collect.py --client "$CLIENT" --dataset "$DATASET" --shards "$SHARDS" --chained \
+            --key-index "$KEY_INDEX" --wait-minutes "$WAIT"
