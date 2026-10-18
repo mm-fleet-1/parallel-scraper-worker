@@ -22,6 +22,7 @@ import argparse
 import json
 import os
 import sys
+import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
 from io import BytesIO
@@ -41,10 +42,22 @@ def _q(var: str) -> str:
     return s.split("?", 1)[1] if "?" in s else s.lstrip("?")
 
 
+_TL = threading.local()
+
+
+def _session() -> requests.Session:
+    """18 Oct (codex review): one keep-alive session per worker thread instead of a new connection per GET."""
+    s = getattr(_TL, "s", None)
+    if s is None:
+        s = _TL.s = requests.Session()
+        s.mount("https://", requests.adapters.HTTPAdapter(pool_connections=4, pool_maxsize=4))
+    return s
+
+
 def get(url: str, rq: str) -> bytes | None:
     for attempt in range(4):
         try:
-            r = requests.get(f"{url}?{rq}", timeout=60)
+            r = _session().get(f"{url}?{rq}", timeout=60)
             if r.status_code == 200:
                 return r.content
             if r.status_code == 404:
