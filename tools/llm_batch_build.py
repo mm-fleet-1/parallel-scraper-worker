@@ -127,6 +127,7 @@ def fetch_raw(url: str) -> bytes:
 
 COLLAGE = "collage:"
 QUARTERS = "quarters:"
+WHOLE = "whole:"   # 18 Oct 4-arm test: same fetch / brightening / resize / label as quarters:, but only the whole view
 # v1 quarter names (runs/2026-10-16_cooling_recheck/full_run.py QN) and crop boxes (parlour_prep.py BOX)
 QN = ["top-left", "top-right", "bottom-left", "bottom-right"]
 BOX = [[0, 0, .5, .5], [.5, 0, 1, .5], [0, .5, .5, 1], [.5, .5, 1, 1]]
@@ -405,12 +406,14 @@ def build_line(sk: dict, dim: int, pool: ThreadPoolExecutor,
 
     def one(i: int):
         u = urls[i]
-        if not u.startswith(QUARTERS):
+        pre = QUARTERS if u.startswith(QUARTERS) else WHOLE if u.startswith(WHOLE) else None
+        if pre is None:
             return _fetch_or_none(u, dim, u in optional)
         if stamp or i >= len(labels) or "|" not in labels[i]:
-            raise SystemExit(f"row {sk.get('key')}: a quarters: image needs a '<n>|<label>' label and stamp=false")
+            raise SystemExit(f"row {sk.get('key')}: a {pre} image needs a '<n>|<label>' label and stamp=false")
         n, lab = labels[i].split("|", 1)
-        return quarters_or_empty(u[len(QUARTERS):], int(n), lab, dim)
+        views5 = quarters_or_empty(u[len(pre):], int(n), lab, dim)
+        return views5 if pre == QUARTERS else views5[:1]
 
     fetched = list(pool.map(one, range(len(urls))))
     sent = 0
