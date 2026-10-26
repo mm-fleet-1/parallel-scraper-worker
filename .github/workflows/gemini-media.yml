@@ -1,0 +1,29 @@
+name: gemini-media
+# One Gemini call over one media file in the private media blob (tools/gemini_media.py).
+# Public repo: inputs are blob paths only; the media, prompt and answer stay in blob, and the
+# log shows token counts and cost only. No artifacts are uploaded.
+on:
+  workflow_dispatch:
+    inputs:
+      media:   { required: true,  type: string }   # blob path under scraper-media/
+      prompt:  { required: true,  type: string }   # blob path of the prompt text
+      out:     { required: true,  type: string }   # blob prefix for answer.md + usage.json
+      model:   { required: false, type: string, default: "gemini-3.8-flash" }
+      cap_usd: { required: false, type: string, default: "1.0" }
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: { python-version: "3.12" }
+      - run: pip install --quiet google-genai requests
+      - env:
+          LLM_BATCH_GEMINI_KEY: ${{ secrets.LLM_BATCH_GEMINI_KEY }}
+          MEDIA_BLOB_READ_SAS: ${{ secrets.MEDIA_BLOB_READ_SAS }}
+          MEDIA_BLOB_WRITE_SAS: ${{ secrets.MEDIA_BLOB_WRITE_SAS }}
+        run: |
+          python tools/gemini_media.py --media "${{ inputs.media }}" --prompt "${{ inputs.prompt }}" \
+            --out "${{ inputs.out }}" --model "${{ inputs.model }}" --cap-usd "${{ inputs.cap_usd }}"
