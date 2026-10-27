@@ -317,6 +317,36 @@ _CONTEXT_KW = dict(
 )
 
 
+def _load_session_kw() -> dict:
+    """Signed-in Google session (Oct 2026: logged-out sessions get the 10-photo limited
+    view). PHASE2_GOOGLE_STATE = Playwright storage_state JSON, as base64 (the fleet
+    secret, one line so Actions masks it) or raw JSON. Unset or invalid: {} (logged out;
+    the limited view is then detected and not retried). Never logged."""
+    import base64, json, os
+    raw = os.environ.get("PHASE2_GOOGLE_STATE", "").strip()
+    if not raw:
+        return {}
+    try:
+        state = json.loads(raw if raw.startswith("{") else base64.b64decode(raw).decode("utf-8"))
+        ck = state.get("cookies") if isinstance(state, dict) else None
+        if not isinstance(ck, list) or not ck or not all(
+                isinstance(c, dict) and all(isinstance(c.get(k), str) for k in ("name", "value", "domain"))
+                for c in ck) or not isinstance(state.get("origins", []), list):
+            raise ValueError("not a storage_state")
+    except Exception as e:
+        logger.warning("phase2_session.google_state_invalid (%s) - running logged out",
+                       type(e).__name__)
+        return {}
+    logger.info("phase2_session.google_state cookies=%d", len(state["cookies"]))
+    # The session was made in desktop Chrome: send a full Chrome UA with it.
+    return {"storage_state": state, "user_agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+        "(KHTML, like Gecko) Chrome/145.0.0.0 Safari/537.36")}
+
+
+_SESSION_KW = _load_session_kw()
+
+
 class PlaywrightSession:
     """Long-lived Playwright browser + page held by a Phase-2 consumer thread.
 
@@ -371,7 +401,7 @@ class PlaywrightSession:
                 headless=True,
                 args=["--disable-dev-shm-usage", "--disable-gpu"],
             )
-            self._context = await self._browser.new_context(**_CONTEXT_KW)
+            self._context = await self._new_context()
             if self._good_cookies:
                 await self._context.add_cookies(self._good_cookies)
             self._page = await self._context.new_page()
@@ -444,6 +474,19 @@ class PlaywrightSession:
             self._close_browser()
             self._open_browser()
 
+    async def _new_context(self):
+        """A new context with the signed-in session when one is configured. If Playwright
+        rejects the session, warn once (type only, never the value) and run logged out."""
+        global _SESSION_KW
+        if _SESSION_KW:
+            try:
+                return await self._browser.new_context(**{**_CONTEXT_KW, **_SESSION_KW})
+            except Exception as e:
+                logger.warning("phase2_session.google_state_rejected (%s) - running logged out",
+                               type(e).__name__)
+                _SESSION_KW = {}
+        return await self._browser.new_context(**_CONTEXT_KW)
+
     async def _remember_good(self) -> None:
         try:
             self._good_cookies = await self._context.cookies()
@@ -454,7 +497,7 @@ class PlaywrightSession:
         """Replace the context with a new one seeded with the good cookies (~0.1 s,
         no warm-up: the seed is what unlocks the full page)."""
         old = self._context
-        self._context = await self._browser.new_context(**_CONTEXT_KW)
+        self._context = await self._new_context()
         await self._context.add_cookies(self._good_cookies)
         self._page = await self._context.new_page()
         try:
@@ -730,7 +773,12 @@ class PlaywrightSession:
                     self._loop.run_until_complete(self._remember_good())
             else:
                 left = max_s - int(time.monotonic() - t_start)
-                if left >= DEGRADED_RETRY_MIN_S:
+                # Google's logged-out limited view is server-side: the retry recovered 0
+                # of 40 (fleet) and 0 of 6 (local) for ~30 s each. PHASE2_LIMITED_VIEW_RETRY=1
+                # retries anyway, in case Google rolls the gate back.
+                limited = wm0.get("limited_view") and \
+                    _os.environ.get("PHASE2_LIMITED_VIEW_RETRY", "0") != "1"
+                if left >= DEGRADED_RETRY_MIN_S and not limited:
                     # Session-scoped degraded page: a seeded new context (else a relaunched
                     # browser) gets the full page back, as in panel_extras. Panel data from
                     # scrape() is kept.
@@ -788,6 +836,10 @@ class PlaywrightSession:
                         wm["truncated"] = 1
             if bad_panel:
                 hc["walk_meta"]["degraded_panel"] = 1
+            hc["walk_meta"]["signed_in"] = int(bool(_SESSION_KW))
+            if _SESSION_KW and hc["walk_meta"].get("limited_view"):
+                # Signed in but gated: the session expired or Google signed it out.
+                logger.warning("phase2_session.google_session_limited place_id=%s", place_id)
         except Exception:
             logger.warning("phase2_session.media_capture_failed place_id=%s",
                            place_id, exc_info=True)
