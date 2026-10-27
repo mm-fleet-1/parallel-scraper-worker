@@ -221,6 +221,17 @@ _SCROLL_GRID = """() => {
 
 _GRID_COUNT = "() => document.querySelectorAll('[data-photo-index]').length"
 
+# Google's logged-out "limited view" (live Oct 2026, ~100% of sessions by late Oct):
+# a fixed 10-tile gallery, no chips, and a "See more photos" button that opens a
+# sign-in dialog. Server-side: no relaunch, cookie seed, UA, hl/gl or URL form lifts it.
+_LIMITED_VIEW = r"""() => !!document.querySelector('button[aria-label="See more photos"]')
+    || /limited view of Google Maps/i.test(document.body.innerText)"""
+
+# The panel's photo total ("13 Photos" button on Overview): what the walk could not reach.
+_PHOTO_TOTAL = r"""() => { for (const b of document.querySelectorAll('button')) {
+    const m = /^\s*([\d,]+)\s+Photos?\s*$/i.exec(b.textContent || '');
+    if (m) return parseInt(m[1].replace(/,/g, ''), 10); } return null; }"""
+
 _CLICK_TILE0 = """() => { const t = document.querySelector('[data-photo-index="0"]');
     if (t) t.click(); return !!t; }"""
 
@@ -281,9 +292,10 @@ async def _load_more(page, timeout_ms: int = LAZY_TIMEOUT_MS) -> bool:
     loaded ones, so Next turns off at the last loaded tile until the grid is scrolled.
     Scroll it and wait for more tiles or Next back on, LAZY_TRIES times inside one
     ceiling; False = no growth (the end, or a stall the caller judges with _stalled).
-    Live (Oct 2026): the DEGRADED session render (no Menu/About panel tabs, no chips)
-    is a fixed 10-tile preview that never grows, whatever is scrolled, and goto or
-    reload keep it; only a fresh browser session gets the full gallery back."""
+    Live (Oct 2026): the DEGRADED render is Google's logged-out "limited view"
+    (_LIMITED_VIEW): a fixed 10-tile preview that never grows, whatever is scrolled.
+    Early Oct a relaunch got the full gallery back ~25% of the time; by late Oct the
+    gate covers ~every session and only a signed-in session shows more."""
     budget = min(LAZY_TIMEOUT_MS, timeout_ms)
     for _ in range(LAZY_TRIES):
         n = await page.evaluate(_SCROLL_GRID)
@@ -465,7 +477,7 @@ def _new_walk_meta(entry: str | None) -> dict:
             "truncated": 0, "limits_hit": [], "truncated_reasons": [], "chip_unavailable": 0,
             "latest_ordered": None, "video_count": 0, "pano_count": 0, "unknown_count": 0,
             "chips_seen": [], "timings": {}, "entry": entry, "menu_count": 0,
-            "degraded_gallery": 0}
+            "degraded_gallery": 0, "limited_view": 0, "page_photo_total": None}
 
 
 async def _walk_gallery(page, chips: list[str], wm: dict, photo_cap: int, max_items: int,
@@ -660,6 +672,7 @@ async def capture_horeca(page, photo_cap: int = PHOTO_CAP_DEFAULT, with_menu: bo
     try:
         before = {lbl for lbl, _ in await page.evaluate(_TABS)}
         pre = await _snap(page)          # key before the viewer opens (§9.1)
+        wm["page_photo_total"] = await page.evaluate(_PHOTO_TOTAL)   # any pane (menu path too)
         entered, ceiling = None, 0
         # Menu thumbs only exist after a menu walk; without one, a "Photo "
         # button on the Reviews pane is a reviewer photo, so go via the cover.
@@ -675,6 +688,7 @@ async def capture_horeca(page, photo_cap: int = PHOTO_CAP_DEFAULT, with_menu: bo
                 # In-page click: a pointer click lands on the overlay instead.
                 await ov.evaluate("e => e.click()")
                 await _wait_js(page, _ENTRY_PRESENT, timeout_ms=2_000)
+            wm["page_photo_total"] = (await page.evaluate(_PHOTO_TOTAL)) or wm["page_photo_total"]
             # "See photos" opens the FULL gallery (viewer on item 1, Next walks
             # every photo). The hero image can open a ~10-item preview carousel
             # instead — Akansha Medical: hero 10, See photos 29. Hero is only the
@@ -693,8 +707,12 @@ async def capture_horeca(page, photo_cap: int = PHOTO_CAP_DEFAULT, with_menu: bo
             await _wait_js(page, _NEW_TABS, sorted(before), _ms_left(t_entry, ceiling))
             chips = await _list_gallery_chips(page, before)
             wm["chips_seen"] = chips
+            wm["limited_view"] = int(await page.evaluate(_LIMITED_VIEW))
             out["items"] = await _walk_gallery(page, chips, wm, place_photo_cap,
                                                walk_max_items, walk_max_s, entry)
+            if wm["limited_view"]:
+                wm["truncated_reasons"].append("limited_view")
+                wm["truncated"] = 1
             await page.keyboard.press("Escape")
         else:
             wm["reason"] = "no_entry"
