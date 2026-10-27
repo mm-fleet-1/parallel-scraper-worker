@@ -168,6 +168,10 @@ jobs:
         env:
           WORKER_API_BASE: ${{ vars.WORKER_API_BASE }}
           WORKER_TOKEN: ${{ secrets.WORKER_TOKEN }}
+          # Signed-in Google session (Oct 2026: logged out = 10-photo "limited view").
+          # Base64 storage_state, one line so it stays masked. Repo variable
+          # GOOGLE_SESSION_OFF=1 runs logged out (kill switch). Unset secret = logged out.
+          PHASE2_GOOGLE_STATE: ${{ vars.GOOGLE_SESSION_OFF != '1' && secrets.PHASE2_GOOGLE_STATE || '' }}
           PHASE2_CAPTURE_SCREENSHOTS: "${{ inputs.screenshots || '1' }}"
           # Worker INFO (TIMING, phase2.*) to stderr; without it the runner log had none (p10).
           PHASE2_LOG_LEVEL: INFO
