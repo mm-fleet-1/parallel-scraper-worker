@@ -258,7 +258,8 @@ def _photos_one(run_id, pid, row, panel_urls) -> tuple[list[dict], dict]:
                 "source": sel.source, "status": o["status"], "sha1": o["sha1"],
                 "width": o["width"], "height": o["height"], "bytes": o["bytes"],
                 "dhash": gs.signed64(sel.dhash), "stale": sel.stale, "fetched_at": fetched_at,
-                "pano_url": sv.get("pano_url") if is_sv else None})
+                "pano_url": sv.get("pano_url") if is_sv else None,
+                "google_photo_id": _photo_id(sel.gid)})
     except Exception:
         logger.warning("phase2.photos_failed run_id=%s pid=%s", run_id, pid, exc_info=True)
         wm = {**wm, "walk_ok": False, "reason": "photo_pipeline_error"}
@@ -272,6 +273,11 @@ def _photos_one(run_id, pid, row, panel_urls) -> tuple[list[dict], dict]:
     else:
         row["photo_dates"] = {**pd, "summary": summ}
     return media, tm
+
+
+def _photo_id(key) -> str | None:   # one definition: gallery_select.photo_id
+    from parallel_scraper import gallery_select as _gs
+    return _gs.photo_id(key)
 
 
 def _slim_photo_dates(pd, summ, cands, selected, sv) -> dict:
@@ -423,7 +429,8 @@ def _lease_with_retry(state, run_id, shard, batch, attempts: int = 5,
     only rows un-served in another API pod's buffer can still come back, and those
     are released at PHASE2_LEASE_MAX_AGE_S (600) — a later top-up run picks them up.
     """
-    max_wait = float(os.environ.get("PHASE2_EMPTY_LEASE_MAX_WAIT_S") or 180)
+    # 300 s: covers the API's tail release (PHASE2_LEASE_TAIL_IDLE_S 60 s + a 15 s claimer tick).
+    max_wait = float(os.environ.get("PHASE2_EMPTY_LEASE_MAX_WAIT_S") or 300)
     waited, i = 0.0, 0
     while True:
         leased = state.claim_place_ids(run_id, str(shard), int(batch))
@@ -456,6 +463,9 @@ def _lease_with_retry(state, run_id, shard, batch, attempts: int = 5,
             flush()
         time.sleep(pause)
         waited += pause
+        fresh = getattr(state, "fresh_connection", None)
+        if fresh is not None:   # next lease over a new connection: maybe another API pod
+            fresh()
 
 
 def _resolve_concurrency(concurrency) -> int:
