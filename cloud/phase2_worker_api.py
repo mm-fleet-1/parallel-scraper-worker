@@ -44,24 +44,40 @@ _SHOT_DIR = os.environ.get("PHASE2_SHOT_DIR") or None
 _SHOT_MANIFEST_LOCK = threading.Lock()
 
 
-def _sink_shots(state, run_id, pid, attempts, shots):
+def _sink_shots(state, run_id, pid, attempts, shots) -> list[dict]:
     """Persist a place's screenshots — Blob staging, artifact dir, or the API,
-    in that order (see module comment). Best-effort; callers wrap in try/except."""
+    in that order (see module comment). Best-effort; callers wrap in try/except.
+    Returns the place_screenshots rows of the Blob PUTs that landed ({kind, uri}); they ride
+    in the result, so submit/ingest index them in the same transaction (1 Nov). The
+    artifact / API fallbacks are indexed by their drains, as before."""
     if not shots:
-        return
+        return []
     from cloud import blob_shots
-    if blob_shots.blob_sas_url():
+    rows: list[dict] = []
+    sas = blob_shots.blob_sas_url()
+    if sas:
+        base = blob_shots._split_sas(sas)[0]
         failed = {}
         for kind, src in shots.items():
             try:
-                blob_shots.put_shot(run_id, pid, kind, attempts, src)
+                name = blob_shots.put_shot(run_id, pid, kind, attempts, src)
+                rows.append({"kind": str(kind), "uri": f"{base}/{name}"})
             except Exception:
                 logger.warning("phase2.shot_blob_put_failed run_id=%s pid=%s kind=%s",
                                run_id, pid, kind, exc_info=True)
                 failed[kind] = src
         if not failed:
-            return
+            return rows
         shots = failed  # fall through: stage the failures via dir/API instead
+    try:
+        _sink_shots_fallback(state, run_id, pid, attempts, shots)
+    except Exception:
+        logger.warning("phase2.shot_fallback_failed run_id=%s pid=%s", run_id, pid, exc_info=True)
+    return rows
+
+
+def _sink_shots_fallback(state, run_id, pid, attempts, shots) -> None:
+    """Artifact dir, else the API (indexed later by their drains)."""
     if _SHOT_DIR:
         Path(_SHOT_DIR).mkdir(parents=True, exist_ok=True)
         manifest = Path(_SHOT_DIR) / "manifest.jsonl"
@@ -706,11 +722,12 @@ def _scrape_one(session, run_id, pid, attempts, capture_shots, shot_state, state
                      else ([], {"thumbs": 0, "mirror": 0}))
         if os.environ.get("PHASE2_LEGACY_PANEL_PHOTOS", "0") == "1":
             _sink_photos(run_id, pid, urls)
+        shot_rows: list = []
         if capture_shots:
             try:
                 shots = (session.screenshot_paths(pid)
                          if hasattr(session, "screenshot_paths") else {})
-                _sink_shots(shot_state, run_id, pid, attempts, shots)
+                shot_rows = _sink_shots(shot_state, run_id, pid, attempts, shots) or []
             except Exception:
                 logger.warning("phase2.shot_sink_failed run_id=%s pid=%s",
                                run_id, pid, exc_info=True)
@@ -718,7 +735,8 @@ def _scrape_one(session, run_id, pid, attempts, capture_shots, shot_state, state
         extras = _panel_extras_one(session, run_id, pid)
         row["timing"] = _place_timing(row.get("timing"), walk_tm, tm, _ms(t0, time.monotonic()))
         done = {"place_id": pid, "attempts": attempts,
-                "data": json.dumps(_na_to_none(row), default=str), "image_urls": urls, "media": media}
+                "data": json.dumps(_na_to_none(row), default=str), "image_urls": urls, "media": media,
+                "screenshots": shot_rows}
         timing = _timing_line(pid, row["timing"])
         print(timing, flush=True)   # p10: unconditional, whatever the log handlers do
         logger.info(timing)
