@@ -39,6 +39,14 @@ class HttpState:
         if ca_bundle:
             self._s.verify = ca_bundle
 
+    def fresh_connection(self) -> None:
+        """Drop pooled keep-alive connections, so the next request may reach another API pod
+        (a 'pending' empty lease means another pod may hold this run's leases)."""
+        try:
+            self._s.close()
+        except Exception:  # noqa: BLE001
+            pass
+
     # Retry transient 5xx / connection errors long enough to ride out a single API pod
     # restart or a brief overload (a single replica means there IS such a window). With
     # the defaults below the backoff sums to ~90s before giving up. lease/submit are
