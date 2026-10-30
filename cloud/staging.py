@@ -129,6 +129,7 @@ def build_object(run_id: str, result: dict, outcome: str, *, repair_gen: int = 0
             "outcome": outcome, "data": result.get("data"),
             "image_urls": list(result.get("image_urls") or []),
             "media": list(result.get("media") or []),
+            "screenshots": list(result.get("screenshots") or []),
             "attributes": attributes or None, "error": result.get("error")}
     raw = json.dumps(body, sort_keys=True, ensure_ascii=True, separators=(",", ":"),
                      default=str).encode("ascii")
