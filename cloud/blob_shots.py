@@ -151,15 +151,17 @@ def _put_blob(name: str, body: bytes, content_type: str, meta: dict,
 
 
 def put_shot(run_id: str, place_id: str, kind: str, attempts: int,
-             local_path: str, sas_url: str | None = None, session=None) -> None:
-    """PUT one screenshot PNG. Raises on final failure so the caller can fall
-    back to the artifact-dir path."""
+             local_path: str, sas_url: str | None = None, session=None) -> str:
+    """PUT one screenshot PNG and return its blob name. Raises on final failure so the
+    caller can fall back to the artifact-dir path."""
     with open(local_path, "rb") as f:
         body = f.read()
-    _put_blob(screenshot_name(run_id, place_id, kind), body, "image/png",
+    name = screenshot_name(run_id, place_id, kind)
+    _put_blob(name, body, "image/png",
               {"runid": run_id, "placeid": place_id, "kind": kind,
                "attempts": int(attempts)},
               sas_url=sas_url, session=session)
+    return name
 
 
 def upload_menu_photos(run_id: str, place_id: str, menu_photos,
