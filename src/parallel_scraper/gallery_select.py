@@ -39,6 +39,14 @@ class Selected:
     ordinal: int = 0                     # first-seen walk ordinal
     source: str = "gallery"              # primary: owner when any member is owner
     band: str = ""                       # a | b | c | d | e
+    gid: str | None = None               # Google photo id ('!1s' viewer key) of the first-seen item
+
+
+def photo_id(key) -> str | None:
+    """Google's photo id: the viewer URL's '!1s' value (horeca_capture viewer_url_key). The
+    walk falls back to the whole href when the URL has none; that is not an id."""
+    k = (key or "").strip() if isinstance(key, str) else ""
+    return k if k and "://" not in k and len(k) <= 200 else None
 
 
 def parse_photo_month(caption: str | None) -> str | None:
@@ -152,6 +160,8 @@ def _merge(into: dict, g: dict) -> None:
     if g["month"] and (into["month"] is None or g["month"] > into["month"]):
         into["month"], into["caption"] = g["month"], g["caption"]
     into["ordinal"] = min(into["ordinal"], g["ordinal"])
+    if not into.get("gid"):
+        into["gid"] = g.get("gid")
 
 
 def select_photos(items, *, now, cap: int = 20, thresh: int = 8,
@@ -176,7 +186,7 @@ def select_photos(items, *, now, cap: int = 20, thresh: int = 8,
              "sources": set(it.get("sources") or [it.get("source") or "gallery"]),
              "month": parse_photo_month(it.get("caption")), "caption": it.get("caption"),
              "ordinal": int(it.get("ordinal", 0)), "chip": (it.get("chip") or "").lower(),
-             "dhash": None}
+             "dhash": None, "gid": photo_id(it.get("viewer_key"))}
         if g["base"] in by_base:
             _merge(by_base[g["base"]], g)
             continue
@@ -231,7 +241,7 @@ def _to_selected(g: dict, band: str) -> Selected:
                     photo_date_raw=g["caption"], dhash=g["dhash"],
                     stale=1 if band == "e" else 0, ordinal=g["ordinal"],
                     source="owner" if "owner" in g["sources"] else sorted(g["sources"])[0],
-                    band=band)
+                    band=band, gid=g.get("gid"))
 
 
 def _ok(o) -> bool:
