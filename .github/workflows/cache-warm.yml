@@ -1,0 +1,132 @@
+name: cache-warm
+# Fills this repo's Actions caches (venv, Playwright browser, Playwright system .debs) without
+# scraping, so the next phase2-scrape shard starts on the fast path (~21 s setup, not ~52-75 s).
+# Why: caches are per repo, saved only when a job ENDS (a scrape job runs for hours), keyed on
+# deps / Python build / runner image, and deleted by GitHub after 7 days unused.
+#   - dispatch on every fleet after a dependency, workflow or runner-image change, and before a wave
+#     (a repo with no browser cache needs TWO runs: run 1 browser+venv, run 2 the .debs);
+#   - the weekly schedule keeps the caches from the 7-day eviction between waves.
+# The setup steps below MUST stay identical to the scrape job's in phase2-scrape.yml (same cache
+# keys); tests/test_phase2_sequencer.py checks this.
+on:
+  workflow_dispatch: {}
+  schedule:
+    - cron: "17 3 * * 1,4"   # Mon + Thu 03:17 UTC: never 7 days without use
+
+concurrency:
+  group: cache-warm
+  cancel-in-progress: false
+
+jobs:
+  warm:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 20
+    steps:
+      - name: Startup marker
+        run: echo "STARTUP t_job_start=$(date +%s)"
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+      - name: Checkout marker
+        run: echo "STARTUP t_checkout=$(date +%s)"
+      - name: Pin VM self-signed cert if present
+        run: |
+          if [ -f "$GITHUB_WORKSPACE/worker_ca.pem" ]; then
+            echo "WORKER_CA_BUNDLE=$GITHUB_WORKSPACE/worker_ca.pem" >> "$GITHUB_ENV"
+            echo "pinned VM cert -> WORKER_CA_BUNDLE"
+          fi
+      - uses: actions/setup-python@v5
+        id: py
+        with:
+          python-version: "3.11"
+      # The whole venv (startup, 1 Nov: pip was 32 s of every shard start). Keyed on the exact
+      # Python build too: the venv links to it. A dependency or Python change = one rebuild.
+      - name: Cache venv
+        id: venv
+        uses: actions/cache@v4
+        with:
+          path: .venv
+          key: venv-${{ runner.os }}-py${{ steps.py.outputs.python-version }}-${{ hashFiles('uv.lock', 'pyproject.toml') }}
+      # Keyed on uv.lock; the public worker repo may only carry pyproject.toml, so hash both.
+      # Restored on every run (Codex 1 Nov): a restore counts as use, so the 7-day eviction never
+      # drops it while the venv is warm; a later Python patch (new venv key) then still has it.
+      - name: Cache pip/uv downloads
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cache/pip
+            ~/.cache/uv
+          key: pydeps-${{ runner.os }}-${{ hashFiles('uv.lock', 'pyproject.toml') }}
+      - name: Cache Playwright browsers
+        id: pw
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/ms-playwright
+          key: ms-playwright-${{ runner.os }}-${{ hashFiles('uv.lock', 'pyproject.toml') }}
+      - name: Install deps (venv cache miss only; Playwright only — NO DB driver, NO Drive)
+        if: steps.venv.outputs.cache-hit != 'true'
+        run: |
+          python -m venv .venv
+          .venv/bin/python -m pip install --upgrade pip
+          .venv/bin/pip install -e .
+      - name: Use venv
+        run: |
+          echo "$GITHUB_WORKSPACE/.venv/bin" >> "$GITHUB_PATH"
+          echo "VIRTUAL_ENV=$GITHUB_WORKSPACE/.venv" >> "$GITHUB_ENV"
+          echo "RUNNER_IMAGE=${ImageOS:-x}-${ImageVersion:-x}" >> "$GITHUB_ENV"   # for the .deb cache key
+          echo "STARTUP t_deps=$(date +%s)"
+      - name: Install Playwright chromium (cache miss only)
+        if: steps.pw.outputs.cache-hit != 'true'
+        run: python -m playwright install --with-deps chromium
+      # The ubuntu-22.04 image lacks 9 font packages Playwright needs (CJK/Thai/Cyrillic/unifont;
+      # canary 1 Nov). Their .debs are cached per runner image so a start installs them with no
+      # apt update (~28 s -> a few s). A new image version = a new key = one full install.
+      - name: Cache Playwright system .debs
+        if: steps.pw.outputs.cache-hit == 'true'
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/pwdebs
+          key: pwdebs-${{ env.RUNNER_IMAGE }}-${{ hashFiles('uv.lock', 'pyproject.toml') }}
+      # Cache hit: the browser files are there; the runner may still lack system packages.
+      # Order: all present -> skip; cached .debs -> install them; else the full install, as before
+      # (and keep its .debs for the next start).
+      - name: Check Playwright chromium (cache hit)
+        if: steps.pw.outputs.cache-hit == 'true'
+        run: |
+          # install, not skip: an unpinned playwright upgrade keeps the old browser cache key
+          # (2026-10-16: 1.64 wanted chromium 1248, cache held an older build -> every worker failed setup).
+          # A no-op when the cached build already matches.
+          python -m playwright install chromium
+          # Newer playwright: the dry run itself says "All system dependencies are installed."
+          # (canary 1 Nov). Older: it prints the apt command; then apt's own dry run decides.
+          ok() {
+            out=$(python -m playwright install-deps --dry-run chromium 2>/dev/null)
+            echo "$out" | grep -q "All system dependencies are installed" && return 0
+            pkgs=$(echo "$out" | sed -n 's/.*--no-install-recommends \([^"]*\).*/\1/p' | head -1)
+            [ -n "$pkgs" ] && apt-get -s --no-upgrade install --no-install-recommends $pkgs 2>/dev/null \
+              | grep -q '^0 upgraded, 0 newly installed'
+          }
+          D="$HOME/.cache/pwdebs"
+          if ok; then
+            echo "playwright system packages: all present, apt skipped"
+          elif ls "$D"/*.deb > /dev/null 2>&1 \
+               && sudo apt-get install -y --no-install-recommends "$D"/*.deb > /tmp/pwdebs.log 2>&1 && ok; then
+            echo "playwright system packages: $(ls "$D"/*.deb | wc -l) cached .debs installed, no apt update"
+          else
+            python -m playwright install-deps chromium
+            # Stage, then publish only a complete copy (Codex 1 Nov): a cache key is immutable, so a
+            # partial .deb dir saved once would stay broken. No dir = nothing saved, next run retries.
+            T="$D.tmp"; rm -rf "$T" "$D"; mkdir -p "$T"
+            if cp /var/cache/apt/archives/*.deb "$T"/ 2>/dev/null && ls "$T"/*.deb > /dev/null 2>&1; then
+              mv "$T" "$D"
+              echo "playwright system packages: full install; kept $(ls "$D"/*.deb | wc -l) .debs for the next start"
+            else
+              rm -rf "$T"
+              echo "playwright system packages: full install; .debs not kept (copy failed or none)"
+            fi
+          fi
+      - name: Playwright marker
+        run: echo "STARTUP t_playwright=$(date +%s)"
+      - name: Check (worker imports, chromium starts)
+        run: |
+          python -c "import cloud.phase2_worker_api; from playwright.sync_api import sync_playwright as s; p=s().start(); b=p.chromium.launch(); b.close(); p.stop(); print('cache-warm ok')"
