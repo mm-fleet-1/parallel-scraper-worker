@@ -1,0 +1,58 @@
+name: clip-embed
+
+# CLIP image embeddings for photo-gate training (tools/clip_embed.py). Reads manifest shards from blob
+# (keys + photo URLs only), writes one .npz per shard. No model API calls. Manual dispatch only.
+on:
+  workflow_dispatch:
+    inputs:
+      shards:        { required: true,  type: string, description: "comma-separated shard names" }
+      manifest_base: { required: true,  type: string, description: "blob URL prefix holding <shard>.jsonl (no SAS)" }
+      out_base:      { required: true,  type: string, description: "blob URL prefix for <shard>.npz (no SAS)" }
+      workers:       { required: false, type: string, default: "32" }
+      max_parallel:  { required: false, type: string, default: "20" }
+
+jobs:
+  plan:
+    runs-on: ubuntu-22.04
+    outputs:
+      matrix: ${{ steps.mk.outputs.matrix }}
+    steps:
+      - id: mk
+        env:
+          SHARDS: ${{ inputs.shards }}
+        run: |
+          python3 -c 'import json,os; print("matrix=" + json.dumps([s.strip() for s in os.environ["SHARDS"].split(",") if s.strip()]))' >> "$GITHUB_OUTPUT"
+
+  embed:
+    needs: plan
+    runs-on: ubuntu-22.04
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      max-parallel: ${{ fromJson(inputs.max_parallel) }}
+      matrix:
+        shard: ${{ fromJson(needs.plan.outputs.matrix) }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - uses: actions/cache@v4
+        with:
+          path: ~/.cache/pip
+          key: clip-pip-torch210-oc330
+      - uses: actions/cache@v4
+        with:
+          path: ~/.cache/huggingface
+          key: clip-model-mobileclip2-s0
+      - run: |
+          pip install --quiet torch==2.10.0 torchvision==0.25.0 --index-url https://download.pytorch.org/whl/cpu
+          pip install --quiet open_clip_torch==3.3.0 timm==1.0.30 requests pillow numpy
+      - name: Embed this shard
+        env:
+          MEDIA_BLOB_READ_SAS: ${{ secrets.MEDIA_BLOB_READ_SAS }}
+          MEDIA_BLOB_WRITE_SAS: ${{ secrets.MEDIA_BLOB_WRITE_SAS }}
+        run: |
+          python tools/clip_embed.py \
+            --manifest-url "${{ inputs.manifest_base }}/${{ matrix.shard }}.jsonl" \
+            --out-base "${{ inputs.out_base }}" --shard "${{ matrix.shard }}" --workers "${{ inputs.workers }}"
