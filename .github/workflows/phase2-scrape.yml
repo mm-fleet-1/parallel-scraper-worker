@@ -143,8 +143,9 @@ jobs:
           path: .venv
           key: venv-${{ runner.os }}-py${{ steps.py.outputs.python-version }}-${{ hashFiles('uv.lock', 'pyproject.toml') }}
       # Keyed on uv.lock; the public worker repo may only carry pyproject.toml, so hash both.
+      # Restored on every run (Codex 1 Nov): a restore counts as use, so the 7-day eviction never
+      # drops it while the venv is warm; a later Python patch (new venv key) then still has it.
       - name: Cache pip/uv downloads
-        if: steps.venv.outputs.cache-hit != 'true'   # a venv hit needs no downloads
         uses: actions/cache@v4
         with:
           path: |
@@ -208,8 +209,16 @@ jobs:
             echo "playwright system packages: $(ls "$D"/*.deb | wc -l) cached .debs installed, no apt update"
           else
             python -m playwright install-deps chromium
-            mkdir -p "$D" && cp /var/cache/apt/archives/*.deb "$D"/ 2>/dev/null || true
-            echo "playwright system packages: full install; kept $(ls "$D"/*.deb 2>/dev/null | wc -l) .debs for the next start"
+            # Stage, then publish only a complete copy (Codex 1 Nov): a cache key is immutable, so a
+            # partial .deb dir saved once would stay broken. No dir = nothing saved, next run retries.
+            T="$D.tmp"; rm -rf "$T" "$D"; mkdir -p "$T"
+            if cp /var/cache/apt/archives/*.deb "$T"/ 2>/dev/null && ls "$T"/*.deb > /dev/null 2>&1; then
+              mv "$T" "$D"
+              echo "playwright system packages: full install; kept $(ls "$D"/*.deb | wc -l) .debs for the next start"
+            else
+              rm -rf "$T"
+              echo "playwright system packages: full install; .debs not kept (copy failed or none)"
+            fi
           fi
       - name: Playwright marker
         run: echo "STARTUP t_playwright=$(date +%s)"
