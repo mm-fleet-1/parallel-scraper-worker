@@ -98,19 +98,117 @@ def ref_identity_ok(run_id: str, ref: dict) -> bool:
                 and re.fullmatch(r"[0-9a-f]{64}", sha) and sha[:16] == n["sha16"])
 
 
+# §13d.4 summary semantics: what TRY_CAST(JSON_VALUE(data, '$.photo_dates.summary.<key>') AS ...)
+# returns today, computed in Python. Order = the place_data summary columns.
+SUMMARY_COLS = ("walk_ok", "walk_reason", "photos_walked", "photos_selected", "photos_mirrored", "truncated")
+_NO_SUMMARY = (None,) * len(SUMMARY_COLS)
+_INT_RE = re.compile(r"[+-]?\d+")
+_MAX_INT_CHARS = 20   # longer integer strings overflow every SQL integer type: TRY_CAST -> NULL
+
+
+def _int_text(v: str):
+    """An integer string as SQL's string->int cast reads it (blanks around it allowed), else None.
+    Bounded first: Python's int() raises on very long digit strings (Codex R2 #1)."""
+    t = v.strip(" ")
+    if len(t) > _MAX_INT_CHARS or not _INT_RE.fullmatch(t):
+        return None
+    return int(t)
+
+
+def _no_const(name):
+    raise ValueError(name)   # NaN / Infinity: ISJSON() = 0, so every JSON_VALUE is NULL
+
+
+def _sql_int(v):
+    """TRY_CAST(JSON_VALUE(..) AS int): a JSON integer or an integer string (blanks around it
+    allowed) in int range; true/false, floats ('3.0'), other strings, objects -> NULL."""
+    if isinstance(v, bool) or v is None:
+        return None
+    if isinstance(v, int):
+        n = v
+    elif isinstance(v, str) and _int_text(v) is not None:
+        n = _int_text(v)
+    else:
+        return None
+    return n if -2**31 <= n < 2**31 else None
+
+
+def _sql_bit(v):
+    """TRY_CAST(JSON_VALUE(..) AS bit): true / 'true' (any case) / non-zero number or integer
+    string -> 1; false / 'false' / 0 / '0' -> 0; missing, null, other strings ('yes') -> NULL."""
+    if isinstance(v, bool):
+        return int(v)
+    if isinstance(v, (int, float)):
+        return 0 if v == 0 else 1
+    if isinstance(v, str):
+        t = v.strip(" ")
+        if t.lower() in ("true", "false"):
+            return int(t.lower() == "true")
+        n = _int_text(t)
+        if n is not None:
+            return 0 if n == 0 else 1
+    return None
+
+
+def _sql_text(v, width: int = 200):
+    """JSON_VALUE of a string (NULL over 4000 UTF-16 units, lax mode), cut to nvarchar(width)."""
+    if not isinstance(v, str):
+        return None
+    u = v.encode("utf-16-le", "surrogatepass")
+    if len(u) > 8000:
+        return None
+    return u[:2 * width].decode("utf-16-le", "replace")
+
+
+def summary_cols(data) -> tuple:
+    """The ONE definition of the place_data summary columns (§13d.4, W-12 #5), used by
+    sql_state's writers, rank_of, the gate and result_fetch's overlay. data = the result JSON
+    (str, or an already parsed dict). Returns (walk_ok, walk_reason, photos_walked,
+    photos_selected, photos_mirrored, truncated), each what today's SQL reads from
+    $.photo_dates.summary: walk_ok as TRY_CAST(.. AS bit), the counts and truncated as
+    TRY_CAST(.. AS int), reason as JSON_VALUE cut to 200. Not JSON / no summary -> all None.
+    Lives here, not in sql_state, because rank_of needs it and this file is in the public
+    worker set (sql_state is not); sql_state re-exports it."""
+    try:
+        if isinstance(data, (str, bytes)):
+            data = json.loads(data, parse_constant=_no_const, object_pairs_hook=lambda p: dict(reversed(p)))
+        pd = data.get("photo_dates") if isinstance(data, dict) else None
+        s = pd.get("summary") if isinstance(pd, dict) else None
+        if not isinstance(s, dict):
+            return _NO_SUMMARY
+        return (_sql_bit(s.get("walk_ok")), _sql_text(s.get("reason")), _sql_int(s.get("photos_walked")),
+                _sql_int(s.get("photos_selected")), _sql_int(s.get("photos_mirrored")),
+                _sql_int(s.get("truncated")))
+    except Exception:  # noqa: BLE001 - never raise: a value SQL cannot read is NULL (JSON_VALUE)
+        return _NO_SUMMARY
+
+
+def pointer_flag() -> bool:
+    """PHASE2_RESULT_POINTER=1 (§13d.4). Off (default, and on every worker and the API): today's
+    exact rank and media_partial semantics. On (the mode-1 ingester): summary_cols semantics."""
+    return (os.environ.get("PHASE2_RESULT_POINTER") or "0").strip() == "1"
+
+
 def rank_of(body: dict) -> int:
-    """§13c.3 precedence: 3 = done and complete (walk_ok, not truncated, every media row
-    mirrored), 2 = done and partial, 1 = failed. The worker supplies it; the ingester
-    recomputes it with this same function and never trusts the supplied value."""
+    """§13c.3 precedence: 3 = done and complete, 2 = done and partial, 1 = failed. The worker
+    supplies it; the ingester recomputes it and never trusts the supplied value.
+    Flag off (pointer_flag): today's rule, walk_ok is True, truncated falsy, every media row
+    mirrored. Flag on: walk_ok = 1 and truncated 0 or NULL from summary_cols (§13d.4, J4). The two
+    agree on what workers write (walk_ok bool, truncated 0/1); only odd values (strings, a bool
+    truncated) differ, and those then quarantine on a rank mismatch, never apply wrongly."""
     if body.get("outcome") != "done":
         return 1
+    media = body.get("media") or []
+    mirrored = sum(1 for m in media if (m or {}).get("status") in ("written", "exists"))
+    if pointer_flag():
+        walk_ok, _r, _w, _s, _m, truncated = summary_cols(body.get("data") or "{}")
+        complete = walk_ok == 1 and truncated in (0, None) and mirrored == len(media)
+        return 3 if complete else 2
     try:
         data = json.loads(body.get("data") or "{}")
     except (TypeError, ValueError):
         return 2
     s = ((data or {}).get("photo_dates") or {}).get("summary") or {}
-    media = body.get("media") or []
-    mirrored = sum(1 for m in media if (m or {}).get("status") in ("written", "exists"))
     complete = s.get("walk_ok") is True and not s.get("truncated") and mirrored == len(media)
     return 3 if complete else 2
 
