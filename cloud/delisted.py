@@ -55,13 +55,28 @@ BEGIN
     -- trigger, so the place_core tombstone update must come after it
     DELETE FROM scraper.place_media
      WHERE run_id = @run AND place_id = @pid AND is_menu = 0 AND evidence_run_id IS NULL;
+    -- §13d.3 delisting, statement (1): the summary columns, unconditionally (they are the source of
+    -- truth; a mode-1 row has data NULL). Dynamic SQL: the columns exist only after the §13d DDL.
+    IF COL_LENGTH('scraper.place_data', 'walk_ok') IS NOT NULL
+        EXEC sp_executesql N'UPDATE scraper.place_data
+           SET walk_ok = 0, walk_reason = N''delisted'', photos_selected = 0, photos_mirrored = 0
+         WHERE run_id = @run AND place_id = @pid;', N'@run nvarchar(128), @pid nvarchar(256)', @run, @pid;
+    -- statement (2): the same four values into the JSON, only where the row has JSON. Only these
+    -- keys change (never a whole-summary replace), so photos_walked / truncated stay in the JSON
+    -- as they stay in the columns. A summary (or photo_dates) that is missing gets just these keys.
     UPDATE scraper.place_data
        SET data = CASE WHEN JSON_QUERY(data, '$.photo_dates') IS NULL
                        THEN JSON_MODIFY(data, '$.photo_dates', JSON_QUERY(
                             '{"summary":{"walk_ok":false,"reason":"delisted","photos_selected":0,"photos_mirrored":0}}'))
-                       ELSE JSON_MODIFY(data, '$.photo_dates.summary', JSON_QUERY(
-                            '{"walk_ok":false,"reason":"delisted","photos_selected":0,"photos_mirrored":0}')) END
-     WHERE run_id = @run AND place_id = @pid AND ISJSON(data) = 1;
+                       WHEN JSON_QUERY(data, '$.photo_dates.summary') IS NULL
+                       THEN JSON_MODIFY(data, '$.photo_dates.summary', JSON_QUERY(
+                            '{"walk_ok":false,"reason":"delisted","photos_selected":0,"photos_mirrored":0}'))
+                       ELSE JSON_MODIFY(JSON_MODIFY(JSON_MODIFY(JSON_MODIFY(data,
+                            '$.photo_dates.summary.walk_ok', CAST(0 AS bit)),
+                            '$.photo_dates.summary.reason', N'delisted'),
+                            '$.photo_dates.summary.photos_selected', 0),
+                            '$.photo_dates.summary.photos_mirrored', 0) END
+     WHERE run_id = @run AND place_id = @pid AND data IS NOT NULL AND ISJSON(data) = 1;
 END;
 
 IF EXISTS (SELECT 1 FROM scraper.place_core WHERE run_id = @run AND place_id = @pid)
