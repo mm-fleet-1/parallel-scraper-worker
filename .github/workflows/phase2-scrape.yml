@@ -131,10 +131,20 @@ jobs:
             echo "pinned VM cert -> WORKER_CA_BUNDLE"
           fi
       - uses: actions/setup-python@v5
+        id: py
         with:
           python-version: "3.11"
+      # The whole venv (startup, 1 Nov: pip was 32 s of every shard start). Keyed on the exact
+      # Python build too: the venv links to it. A dependency or Python change = one rebuild.
+      - name: Cache venv
+        id: venv
+        uses: actions/cache@v4
+        with:
+          path: .venv
+          key: venv-${{ runner.os }}-py${{ steps.py.outputs.python-version }}-${{ hashFiles('uv.lock', 'pyproject.toml') }}
       # Keyed on uv.lock; the public worker repo may only carry pyproject.toml, so hash both.
       - name: Cache pip/uv downloads
+        if: steps.venv.outputs.cache-hit != 'true'   # a venv hit needs no downloads
         uses: actions/cache@v4
         with:
           path: |
@@ -147,21 +157,60 @@ jobs:
         with:
           path: ~/.cache/ms-playwright
           key: ms-playwright-${{ runner.os }}-${{ hashFiles('uv.lock', 'pyproject.toml') }}
-      - name: Install deps (Playwright only — NO DB driver, NO Drive)
+      - name: Install deps (venv cache miss only; Playwright only — NO DB driver, NO Drive)
+        if: steps.venv.outputs.cache-hit != 'true'
         run: |
-          python -m pip install --upgrade pip
-          pip install -e .
+          python -m venv .venv
+          .venv/bin/python -m pip install --upgrade pip
+          .venv/bin/pip install -e .
+      - name: Use venv
+        run: |
+          echo "$GITHUB_WORKSPACE/.venv/bin" >> "$GITHUB_PATH"
+          echo "VIRTUAL_ENV=$GITHUB_WORKSPACE/.venv" >> "$GITHUB_ENV"
+          echo "RUNNER_IMAGE=${ImageOS:-x}-${ImageVersion:-x}" >> "$GITHUB_ENV"   # for the .deb cache key
           echo "STARTUP t_deps=$(date +%s)"
       - name: Install Playwright chromium (cache miss only)
         if: steps.pw.outputs.cache-hit != 'true'
         run: python -m playwright install --with-deps chromium
-      # The cache holds browser files only; a fresh runner still needs the system libs.
-      - name: Install Playwright system deps (cache hit)
+      # The ubuntu-22.04 image lacks 9 font packages Playwright needs (CJK/Thai/Cyrillic/unifont;
+      # canary 1 Nov). Their .debs are cached per runner image so a start installs them with no
+      # apt update (~28 s -> a few s). A new image version = a new key = one full install.
+      - name: Cache Playwright system .debs
         if: steps.pw.outputs.cache-hit == 'true'
-        # install, not install-deps: an unpinned playwright upgrade keeps the old browser cache key
-        # (2026-10-16: 1.64 wanted chromium 1248, cache held an older build -> every worker failed setup).
-        # A no-op when the cached build already matches.
-        run: python -m playwright install --with-deps chromium
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/pwdebs
+          key: pwdebs-${{ env.RUNNER_IMAGE }}-${{ hashFiles('uv.lock', 'pyproject.toml') }}
+      # Cache hit: the browser files are there; the runner may still lack system packages.
+      # Order: all present -> skip; cached .debs -> install them; else the full install, as before
+      # (and keep its .debs for the next start).
+      - name: Check Playwright chromium (cache hit)
+        if: steps.pw.outputs.cache-hit == 'true'
+        run: |
+          # install, not skip: an unpinned playwright upgrade keeps the old browser cache key
+          # (2026-10-16: 1.64 wanted chromium 1248, cache held an older build -> every worker failed setup).
+          # A no-op when the cached build already matches.
+          python -m playwright install chromium
+          # Newer playwright: the dry run itself says "All system dependencies are installed."
+          # (canary 1 Nov). Older: it prints the apt command; then apt's own dry run decides.
+          ok() {
+            out=$(python -m playwright install-deps --dry-run chromium 2>/dev/null)
+            echo "$out" | grep -q "All system dependencies are installed" && return 0
+            pkgs=$(echo "$out" | sed -n 's/.*--no-install-recommends \([^"]*\).*/\1/p' | head -1)
+            [ -n "$pkgs" ] && apt-get -s --no-upgrade install --no-install-recommends $pkgs 2>/dev/null \
+              | grep -q '^0 upgraded, 0 newly installed'
+          }
+          D="$HOME/.cache/pwdebs"
+          if ok; then
+            echo "playwright system packages: all present, apt skipped"
+          elif ls "$D"/*.deb > /dev/null 2>&1 \
+               && sudo apt-get install -y --no-install-recommends "$D"/*.deb > /tmp/pwdebs.log 2>&1 && ok; then
+            echo "playwright system packages: $(ls "$D"/*.deb | wc -l) cached .debs installed, no apt update"
+          else
+            python -m playwright install-deps chromium
+            mkdir -p "$D" && cp /var/cache/apt/archives/*.deb "$D"/ 2>/dev/null || true
+            echo "playwright system packages: full install; kept $(ls "$D"/*.deb 2>/dev/null | wc -l) .debs for the next start"
+          fi
       - name: Playwright marker
         run: echo "STARTUP t_playwright=$(date +%s)"
       - name: Scrape (API mode)
