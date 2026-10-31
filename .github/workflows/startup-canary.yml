@@ -79,6 +79,13 @@ jobs:
         \ && cp /var/cache/apt/archives/*.deb \"$D\"/ 2>/dev/null || true\n  echo \"playwright system packages: full install; kept $(ls \"$D\"/*.deb 2>/dev/null | wc -l) .debs for the next start\"\nfi\n"
     - name: Playwright marker
       run: echo "STARTUP t_playwright=$(date +%s)"
-    - name: Canary check
-      run: python -c "import cloud.phase2_worker_api; from playwright.sync_api import sync_playwright as s; p=s().start(); b=p.chromium.launch(); pg=b.new_page(); pg.set_content('<p>canary ok</p>'); print(pg.inner_text('p'));
-        b.close(); p.stop()"
+    - name: Debug check
+      run: 'echo "--- dry-run raw:"; python -m playwright install-deps --dry-run chromium 2>&1 | cut -c1-600
+
+        pkgs=$(python -m playwright install-deps --dry-run chromium 2>/dev/null | sed -n ''s/.*--no-install-recommends \([^"]*\).*/\1/p'' | head -1)
+
+        echo "--- pkgs: [$pkgs]"
+
+        echo "--- sim:"; apt-get -s --no-upgrade install --no-install-recommends $pkgs 2>&1 | tail -6
+
+        '
