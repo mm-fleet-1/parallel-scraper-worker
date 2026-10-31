@@ -152,6 +152,10 @@ def main() -> None:
         out.append({"key": row["key"],
                     "dims": {p: list(F[p][:2]) for p in row["sep"] + row["cur"] if F.get(p) is not None},
                     "fail": [p for p in row["sep"] + row["cur"] if F.get(p) is None], "pairs": pairs})
+    # Before the PUT (Codex 1 Nov): an all-failed result must never be stored, or the rerun after the
+    # credential fix finds it ("result exists, skipped") and the shard is never compared.
+    if paths and all(v is None for v in F.values()):
+        sys.exit(f"{a.shard}: every image failed - check MEDIA_BLOB_READ_SAS")
     body = ("\n".join(json.dumps(o) for o in out) + "\n").encode()
     code = "none"
     for attempt in range(10):   # 18 Oct: Azure 503 (server busy) at 860 parallel jobs - retry with backoff + jitter
@@ -167,8 +171,6 @@ def main() -> None:
     else:
         sys.exit(f"{a.shard}: result PUT failed after retries ({code})")
     print(f"{a.shard}: wrote {len(out)} outlets")
-    if paths and all(v is None for v in F.values()):
-        sys.exit(f"{a.shard}: every image failed - check MEDIA_BLOB_READ_SAS")
 
 
 if __name__ == "__main__":
