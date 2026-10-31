@@ -68,8 +68,7 @@ jobs:
               try:
                   with urllib.request.urlopen(rq, timeout=60) as r: o = json.load(r)
                   print("PAID " + json.dumps({"model": o.get("modelVersion"), "usage": o.get("usageMetadata")}))
-                  print("PAID text: " + o["candidates"][0]["content"]["parts"][0]["text"].replace("
-", " / "))
+                  print("PAID text: " + o["candidates"][0]["content"]["parts"][0]["text"].replace(chr(10), " / "))
               except urllib.error.HTTPError as e:
                   print(f"PAID failed http={e.code} {json.load(e).get('error', {}).get('status', '')}")
           print("KEYCHECK slots_seen=" + str(sum(bool(os.environ.get(n, "").strip()) for n in names)))
