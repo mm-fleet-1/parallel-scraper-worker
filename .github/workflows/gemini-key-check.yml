@@ -2,7 +2,12 @@ name: gemini-key-check
 # Is each Gemini key secret this repo can see present and active? Free GET calls only (models.list, batches.list):
 # no generation, no spend. Logs slot, sha256[:8] fingerprint (spots one key mapped to many fleets), HTTP status and
 # Google's error reason -- never the key or the error message (it can name the project).
-on: workflow_dispatch
+on:
+  workflow_dispatch:
+    inputs:
+      model:
+        description: "optional: model for ONE paid generate call (2-line haiku, <=60 tokens) on the first key; blank = free checks only"
+        default: ""
 permissions: {}
 jobs:
   check:
@@ -10,6 +15,7 @@ jobs:
     timeout-minutes: 5
     steps:
       - env:
+          MODEL: ${{ inputs.model }}
           LLM_BATCH_GEMINI_KEY: ${{ secrets.LLM_BATCH_GEMINI_KEY }}
           LLM_BATCH_GEMINI_KEY_1: ${{ secrets.LLM_BATCH_GEMINI_KEY_1 }}
           LLM_BATCH_GEMINI_KEY_2: ${{ secrets.LLM_BATCH_GEMINI_KEY_2 }}
@@ -52,4 +58,18 @@ jobs:
               if not k: continue
               m, mw = get("models?pageSize=1", k); b, bw = get("batches?pageSize=1", k)
               print(f"KEYCHECK {n} fp={hashlib.sha256(k.encode()).hexdigest()[:8]} models={m} {mw} batches={b} {bw}".rstrip())
+          mdl = os.environ.get("MODEL", "").strip()
+          k = next((os.environ[n].strip() for n in names if os.environ.get(n, "").strip()), "")
+          if mdl and k:
+              body = json.dumps({"contents": [{"parts": [{"text": "Write a 2-line haiku about a street-corner shop."}]}],
+                                 "generationConfig": {"maxOutputTokens": 60}}).encode()
+              rq = urllib.request.Request(B + f"models/{mdl}:generateContent", data=body,
+                                          headers={"x-goog-api-key": k, "Content-Type": "application/json"})
+              try:
+                  with urllib.request.urlopen(rq, timeout=60) as r: o = json.load(r)
+                  print("PAID " + json.dumps({"model": o.get("modelVersion"), "usage": o.get("usageMetadata")}))
+                  print("PAID text: " + o["candidates"][0]["content"]["parts"][0]["text"].replace("
+", " / "))
+              except urllib.error.HTTPError as e:
+                  print(f"PAID failed http={e.code} {json.load(e).get('error', {}).get('status', '')}")
           print("KEYCHECK slots_seen=" + str(sum(bool(os.environ.get(n, "").strip()) for n in names)))
