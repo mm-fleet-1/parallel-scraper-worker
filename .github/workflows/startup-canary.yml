@@ -72,11 +72,11 @@ jobs:
       if: steps.pw.outputs.cache-hit == 'true'
       run: "# install, not skip: an unpinned playwright upgrade keeps the old browser cache key\n# (2026-10-16: 1.64 wanted chromium 1248, cache held an older build -> every worker failed setup).\n# A no-op\
         \ when the cached build already matches.\npython -m playwright install chromium\npkgs=$(python -m playwright install-deps --dry-run chromium 2>/dev/null \\\n       | sed -n 's/.*--no-install-recommends\
-        \ \\([^\"]*\\).*/\\1/p' | head -1)\nok() { [ -n \"$pkgs\" ] && dpkg-query -W -f='${db:Status-Abbrev}\\n' $pkgs > /tmp/pwdeps 2>/dev/null \\\n       && ! grep -qv '^ii' /tmp/pwdeps; }\nD=\"$HOME/.cache/pwdebs\"\
-        \nif ok; then\n  echo \"playwright system packages: all $(wc -l < /tmp/pwdeps) present, apt skipped\"\nelif ls \"$D\"/*.deb > /dev/null 2>&1 \\\n     && sudo apt-get install -y --no-install-recommends\
-        \ \"$D\"/*.deb > /tmp/pwdebs.log 2>&1 && ok; then\n  echo \"playwright system packages: $(ls \"$D\"/*.deb | wc -l) cached .debs installed, no apt update\"\nelse\n  python -m playwright install-deps\
-        \ chromium\n  mkdir -p \"$D\" && cp /var/cache/apt/archives/*.deb \"$D\"/ 2>/dev/null || true\n  echo \"playwright system packages: full install; kept $(ls \"$D\"/*.deb 2>/dev/null | wc -l) .debs\
-        \ for the next start\"\nfi\n"
+        \ \\([^\"]*\\).*/\\1/p' | head -1)\n# apt's own dry run, not dpkg-query: Playwright's list has a name dpkg does not know as\n# installed although apt resolves it (canary 1 Nov: the dpkg check never\
+        \ passed).\nok() { [ -n \"$pkgs\" ] && apt-get -s --no-upgrade install --no-install-recommends $pkgs 2>/dev/null \\\n       | grep -q '^0 upgraded, 0 newly installed'; }\nD=\"$HOME/.cache/pwdebs\"\
+        \nif ok; then\n  echo \"playwright system packages: all present, apt skipped\"\nelif ls \"$D\"/*.deb > /dev/null 2>&1 \\\n     && sudo apt-get install -y --no-install-recommends \"$D\"/*.deb > /tmp/pwdebs.log\
+        \ 2>&1 && ok; then\n  echo \"playwright system packages: $(ls \"$D\"/*.deb | wc -l) cached .debs installed, no apt update\"\nelse\n  python -m playwright install-deps chromium\n  mkdir -p \"$D\"\
+        \ && cp /var/cache/apt/archives/*.deb \"$D\"/ 2>/dev/null || true\n  echo \"playwright system packages: full install; kept $(ls \"$D\"/*.deb 2>/dev/null | wc -l) .debs for the next start\"\nfi\n"
     - name: Playwright marker
       run: echo "STARTUP t_playwright=$(date +%s)"
     - name: Canary check
