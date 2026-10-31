@@ -43,6 +43,10 @@ def _build_parser() -> argparse.ArgumentParser:
     p.add_argument("--places-tier", default="ESSENTIALS",
                    choices=["ESSENTIALS", "PRO", "ENTERPRISE"],
                    help="Google Places API tier for Phase 1 Text Search")
+    p.add_argument("--places-language", default="en",
+                   help="Text Search languageCode (e.g. es for Argentina)")
+    p.add_argument("--places-region", default="IN",
+                   help="Text Search regionCode, CLDR two-letter (e.g. AR)")
     p.add_argument("--phase1-workers", type=int, default=3,
                    help="Concurrent Phase 1 workers")
     p.add_argument("--phase2-workers", type=int, default=5,
@@ -266,6 +270,8 @@ def main(argv: list[str] | None = None) -> int:
         queries=queries,
         discovery_backend=args.discovery_backend,
         places_tier=args.places_tier,
+        places_language_code=args.places_language,
+        places_region_code=args.places_region,
         phase1_workers=args.phase1_workers,
         phase2_workers=phase2,
         num_consumer_threads=phase2,    # back-compat field
