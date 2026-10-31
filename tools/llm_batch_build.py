@@ -509,7 +509,8 @@ def marker(kind: str, if_absent: bool = False, **fields):
                 return True
             if if_absent and r.status_code in (409, 412):   # already exists: ours (lost response) or another attempt's
                 try:
-                    g = _http("GET", url, timeout=60)
+                    # reads need the READ SAS: the write fallback (PHASE2_SHOT_BLOB_SAS, sp=cw) cannot GET
+                    g = _http("GET", f"{_MK['base']}.{kind}.json?{sas_query()}", timeout=60)
                     cur = json.loads(g.text) if g.status_code == 200 else {}
                 except Exception:  # noqa: BLE001
                     cur = {}
@@ -533,7 +534,9 @@ def already_submitted() -> str:
     for what, url in (("results", f"{ds}/results/{_MK['shard']}.jsonl"), ("intent", f"{_MK['base']}.intent.json"),
                       ("receipt", f"{_MK['base']}.receipt.json")):
         try:
-            r = _http("HEAD", f"{url}?{_MK['wq']}", timeout=60)
+            # HEAD needs read permission: with a write-only SAS every HEAD is 403, which reads as
+            # "may exist" and refuses every fresh shard (Codex 1 Nov). Read SAS here, write SAS for PUTs.
+            r = _http("HEAD", f"{url}?{sas_query()}", timeout=60)
             code = r.status_code
         except Exception as exc:  # noqa: BLE001  (_http already masks)
             code = type(exc).__name__
