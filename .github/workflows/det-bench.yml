@@ -1,0 +1,59 @@
+name: det-bench
+
+# CPU timing for the Grounding DINO tiny crop proposer (tools/det_bench.py). Benchmark only: reads photos with the
+# read SAS, writes nothing, no model API calls. Manual dispatch only.
+on:
+  workflow_dispatch:
+    inputs:
+      manifest_url: { required: true,  type: string, description: "blob URL of manifest jsonl (no SAS)" }
+      replicas:     { required: false, type: string, default: "3" }
+      threads:      { required: false, type: string, default: "4" }
+
+permissions:
+  contents: read
+
+jobs:
+  plan:
+    runs-on: ubuntu-22.04
+    outputs:
+      matrix: ${{ steps.mk.outputs.matrix }}
+    steps:
+      - id: mk
+        env:
+          REPLICAS: ${{ inputs.replicas }}
+        run: python3 -c 'import json,os; print("matrix=" + json.dumps(list(range(int(os.environ["REPLICAS"])))))' >> "$GITHUB_OUTPUT"
+
+  bench:
+    needs: plan
+    runs-on: ubuntu-22.04
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        replica: ${{ fromJson(needs.plan.outputs.matrix) }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - uses: actions/cache@v4
+        with:
+          path: ~/.cache/pip
+          key: det-pip-torch210-tf530
+      - uses: actions/cache@v4
+        with:
+          path: ~/.cache/huggingface
+          key: det-model-gdino-tiny
+      - name: Install
+        run: |
+          t=$(date +%s)
+          pip install --quiet torch==2.10.0 torchvision==0.25.0 --index-url https://download.pytorch.org/whl/cpu
+          pip install --quiet transformers==5.3.0 requests pillow
+          echo "install_s=$(( $(date +%s) - t ))"
+          lscpu | grep -E "Model name|Flags" | cut -c1-400; free -g | head -2
+      - name: Bench
+        env:
+          MEDIA_BLOB_READ_SAS: ${{ secrets.MEDIA_BLOB_READ_SAS }}
+          MANIFEST_URL: ${{ inputs.manifest_url }}
+          THREADS: ${{ inputs.threads }}
+        run: python tools/det_bench.py --manifest-url "$MANIFEST_URL" --threads "$THREADS"
