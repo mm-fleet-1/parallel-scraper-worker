@@ -9,7 +9,7 @@ from PIL import Image
 
 MODEL = "IDEA-Research/grounding-dino-tiny"
 PROMPT = "a chest freezer. an ice cream freezer. a glass door refrigerator. a display counter. a shop signboard."
-VARIANTS = {"800": (800, 1333, False), "600": (600, 1000, False), "480": (480, 800, False), "480_int8": (480, 800, True)}
+VARIANTS = {"1600": (1600, 1600, False), "800": (800, 1333, False), "600": (600, 1000, False), "480": (480, 800, False), "480_int8": (480, 800, True)}
 
 
 def mask(e):
@@ -22,7 +22,8 @@ def pct(xs, q):
 
 def main():
     a = argparse.ArgumentParser(); a.add_argument("--manifest-url", required=True); a.add_argument("--threads", type=int, default=4)
-    a = a.parse_args(); rs = os.environ["MEDIA_BLOB_READ_SAS"].lstrip("?"); s = requests.Session()
+    a.add_argument("--variants", default="800,600,480,480_int8")
+    a = a.parse_args(); V = {k: VARIANTS[k] for k in a.variants.split(",")}; rs = os.environ["MEDIA_BLOB_READ_SAS"].lstrip("?"); s = requests.Session()
     try:
         r = s.get(f"{a.manifest_url}?{rs}", timeout=60); r.raise_for_status()
     except Exception as e:
@@ -42,10 +43,10 @@ def main():
     torch.set_num_threads(a.threads); torch.set_num_interop_threads(1)
     t = time.time(); proc = AutoProcessor.from_pretrained(MODEL); model = AutoModelForZeroShotObjectDetection.from_pretrained(MODEL).eval()
     load = time.time() - t
-    q8 = torch.ao.quantization.quantize_dynamic(model, {torch.nn.Linear}, dtype=torch.qint8)
-    T = {v: [] for v in VARIANTS}; B = {v: [] for v in VARIANTS}
+    q8 = None if not any(x[2] for x in V.values()) else torch.ao.quantization.quantize_dynamic(model, {torch.nn.Linear}, dtype=torch.qint8)
+    T = {v: [] for v in V}; B = {v: [] for v in V}
     for i, im in enumerate(ims):
-        for v, (se, le, int8) in VARIANTS.items():
+        for v, (se, le, int8) in V.items():
             m = q8 if int8 else model; t = time.perf_counter()
             inp = proc(images=im, text=PROMPT, return_tensors="pt", size={"shortest_edge": se, "longest_edge": le})
             with torch.inference_mode():
@@ -56,9 +57,9 @@ def main():
                 T[v].append(time.perf_counter() - t); B[v].append(len(res["scores"]))
     out = {"cpu": platform.processor() or open("/proc/cpuinfo").read().split("model name")[1].split("\n")[0].strip(": "),
            "nproc": os.cpu_count(), "threads": a.threads, "photos": len(ims), "fetch_p50": pct(fetch, .5),
-           "model_load_s": round(load, 1), "peak_rss_mb": resource.getrusage(resource.RUSAGE_SELF).ru_maxrss // 1024,
+           "variants": a.variants, "model_load_s": round(load, 1), "peak_rss_mb": resource.getrusage(resource.RUSAGE_SELF).ru_maxrss // 1024,
            "torch": torch.__version__, "total_s": round(time.time() - t0)}
-    for v in VARIANTS:
+    for v in V:
         out[v] = {"p50": pct(T[v], .5), "p95": pct(T[v], .95), "mean": round(sum(T[v]) / len(T[v]), 3),
                   "photos_per_hour": round(3600 / (sum(T[v]) / len(T[v]))), "boxes": round(sum(B[v]) / len(B[v]), 1)}
     print("DETBENCH " + json.dumps(out))
