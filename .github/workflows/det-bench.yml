@@ -8,6 +8,7 @@ on:
       manifest_url: { required: true,  type: string, description: "blob URL of manifest jsonl (no SAS)" }
       replicas:     { required: false, type: string, default: "3" }
       threads:      { required: false, type: string, default: "4" }
+      variants:     { required: false, type: string, default: "800,600,480,480_int8", description: "comma list from 1600,800,600,480,480_int8" }
 
 permissions:
   contents: read
@@ -56,4 +57,5 @@ jobs:
           MEDIA_BLOB_READ_SAS: ${{ secrets.MEDIA_BLOB_READ_SAS }}
           MANIFEST_URL: ${{ inputs.manifest_url }}
           THREADS: ${{ inputs.threads }}
-        run: python tools/det_bench.py --manifest-url "$MANIFEST_URL" --threads "$THREADS"
+          VARIANTS: ${{ inputs.variants }}
+        run: python tools/det_bench.py --manifest-url "$MANIFEST_URL" --threads "$THREADS" --variants "$VARIANTS"
